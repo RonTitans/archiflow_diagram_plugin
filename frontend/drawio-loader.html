@@ -1,0 +1,101 @@
+<!DOCTYPE html>
+<html>
+<head>
+    <title>ArchiFlow - Network Diagram Editor</title>
+    <meta charset="utf-8">
+    <style>
+        body { margin: 0; padding: 0; overflow: hidden; font-family: Arial, sans-serif; }
+        #loader {
+            position: fixed;
+            top: 50%;
+            left: 50%;
+            transform: translate(-50%, -50%);
+            text-align: center;
+            z-index: 10000;
+            background: white;
+            padding: 20px;
+            border-radius: 8px;
+            box-shadow: 0 2px 10px rgba(0,0,0,0.1);
+        }
+        .spinner {
+            border: 3px solid #f3f3f3;
+            border-top: 3px solid #667eea;
+            border-radius: 50%;
+            width: 40px;
+            height: 40px;
+            animation: spin 1s linear infinite;
+            margin: 0 auto 10px;
+        }
+        @keyframes spin {
+            0% { transform: rotate(0deg); }
+            100% { transform: rotate(360deg); }
+        }
+        iframe { width: 100vw; height: 100vh; border: none; display: none; }
+    </style>
+</head>
+<body>
+    <div id="loader">
+        <div class="spinner"></div>
+        <h3>Loading ArchiFlow Network Plugin...</h3>
+        <p>Initializing Draw.io with network management tools</p>
+    </div>
+
+    <iframe id="drawio" src="about:blank"></iframe>
+
+    <script>
+        console.log('[ArchiFlow Loader] Starting...');
+
+        const iframe = document.getElementById('drawio');
+        // Load Draw.io via proxy (same origin as this page!)
+        iframe.src = '/drawio/';
+
+        let attempts = 0;
+        const maxAttempts = 30;
+
+        function injectPlugin() {
+            attempts++;
+
+            try {
+                const iframeWindow = iframe.contentWindow;
+                const iframeDoc = iframeWindow.document;
+
+                // Check if Draw.io is loaded
+                if (iframeWindow.Draw && iframeWindow.Draw.loadPlugin) {
+                    console.log('[ArchiFlow Loader] ✅ Draw.io detected, injecting plugin...');
+
+                    iframeWindow.ALLOW_CUSTOM_PLUGINS = true;
+
+                    const script = iframeDoc.createElement('script');
+                    script.src = '/archiflow-network-plugin.js';
+                    script.onload = function() {
+                        console.log('[ArchiFlow Loader] ✅ Plugin loaded successfully!');
+                        document.getElementById('loader').style.display = 'none';
+                        iframe.style.display = 'block';
+                    };
+                    script.onerror = function() {
+                        console.error('[ArchiFlow Loader] ❌ Failed to load plugin');
+                        document.getElementById('loader').style.display = 'none';
+                        iframe.style.display = 'block';
+                    };
+                    iframeDoc.head.appendChild(script);
+
+                } else if (attempts < maxAttempts) {
+                    setTimeout(injectPlugin, 500);
+                } else {
+                    console.error('[ArchiFlow Loader] Timeout waiting for Draw.io');
+                    document.getElementById('loader').style.display = 'none';
+                    iframe.style.display = 'block';
+                }
+            } catch (e) {
+                console.error('[ArchiFlow Loader] Error:', e);
+                if (attempts < maxAttempts) {
+                    setTimeout(injectPlugin, 500);
+                }
+            }
+        }
+
+        iframe.onload = () => setTimeout(injectPlugin, 1000);
+        setTimeout(injectPlugin, 2000);
+    </script>
+</body>
+</html>

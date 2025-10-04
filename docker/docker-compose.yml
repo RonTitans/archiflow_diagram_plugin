@@ -1,0 +1,106 @@
+version: '3.8'
+
+services:
+  # PostgreSQL Database for ArchiFlow
+  archiflow-postgres:
+    image: postgres:15-alpine
+    container_name: archiflow-postgres
+    environment:
+      POSTGRES_DB: archiflow
+      POSTGRES_USER: archiflow_user
+      POSTGRES_PASSWORD: archiflow_pass
+    volumes:
+      - ../database/schema.sql:/docker-entrypoint-initdb.d/01-schema.sql:ro
+      - archiflow-postgres-data:/var/lib/postgresql/data
+    ports:
+      - "5432:5432"
+    networks:
+      - archiflow-network
+    healthcheck:
+      test: ["CMD-SHELL", "pg_isready -U archiflow_user -d archiflow"]
+      interval: 10s
+      timeout: 5s
+      retries: 5
+
+  # Node.js WebSocket Backend Server
+  archiflow-backend:
+    build:
+      context: ../backend
+      dockerfile: ../docker/Dockerfile.backend
+    container_name: archiflow-backend
+    environment:
+      # CRITICAL: Must be postgresql, not mock!
+      DB_MODE: postgresql
+      DB_HOST: archiflow-postgres
+      DB_PORT: 5432
+      DB_NAME: archiflow
+      DB_SCHEMA: archiflow
+      DB_USER: archiflow_user
+      DB_PASSWORD: archiflow_pass
+      WS_PORT: 3333
+      NODE_ENV: development
+    ports:
+      - "3333:3333"
+    networks:
+      - archiflow-network
+    depends_on:
+      archiflow-postgres:
+        condition: service_healthy
+
+  # Frontend Static File Server
+  archiflow-frontend:
+    image: node:18-alpine
+    container_name: archiflow-frontend
+    working_dir: /app
+    volumes:
+      - ../frontend:/app
+      - /app/node_modules
+    ports:
+      - "8081:8081"
+    networks:
+      - archiflow-network
+    command: sh -c "npm install && npm run serve"
+    environment:
+      PORT: 8081
+      WS_URL: ws://localhost:3333
+
+  # Adminer - Database Management UI
+  adminer:
+    image: adminer:latest
+    container_name: archiflow-adminer
+    restart: always
+    ports:
+      - "8082:8080"
+    networks:
+      - archiflow-network
+    environment:
+      ADMINER_DEFAULT_SERVER: archiflow-postgres
+      ADMINER_DESIGN: pepa-linha
+    depends_on:
+      - archiflow-postgres
+
+  # Draw.io Self-Hosted
+  drawio:
+    image: jgraph/drawio:latest
+    container_name: archiflow-drawio
+    restart: always
+    ports:
+      - "8083:8080"
+    networks:
+      - archiflow-network
+    extra_hosts:
+      - "host.docker.internal:host-gateway"
+    volumes:
+      - ./PreConfig.js:/usr/local/tomcat/webapps/draw/js/PreConfig.js:ro
+      - ../frontend/archiflow-network-plugin.js:/usr/local/tomcat/webapps/draw/plugins/archiflow-network-plugin.js:ro
+    environment:
+      # Allow plugin loading
+      DRAWIO_VIEWER_URL: "null"
+      DRAWIO_LIGHTBOX_URL: "null"
+
+networks:
+  archiflow-network:
+    driver: bridge
+
+volumes:
+  archiflow-postgres-data:

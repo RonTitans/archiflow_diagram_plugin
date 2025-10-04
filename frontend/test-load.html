@@ -1,0 +1,44 @@
+<!DOCTYPE html>
+<html>
+<head>
+    <title>Test Load Diagram</title>
+</head>
+<body>
+    <h1>Test Load Diagram</h1>
+    <button id="loadBtn">Load Test Diagram</button>
+    <pre id="output"></pre>
+
+    <script>
+        const ws = new WebSocket('ws://localhost:3333');
+        const output = document.getElementById('output');
+
+        ws.onopen = () => {
+            output.textContent += 'Connected to WebSocket\n';
+        };
+
+        ws.onmessage = (event) => {
+            const message = JSON.parse(event.data);
+            output.textContent += '\n=== Received Message ===\n';
+            output.textContent += 'Type: ' + message.type + '\n';
+            output.textContent += 'Action: ' + message.action + '\n';
+
+            if (message.content) {
+                output.textContent += '\n=== Content Analysis ===\n';
+                output.textContent += 'Content type: ' + typeof message.content + '\n';
+                output.textContent += 'Content length: ' + message.content.length + '\n';
+                output.textContent += 'First 200 chars: ' + message.content.substring(0, 200) + '\n';
+                output.textContent += 'Starts with <?xml: ' + message.content.startsWith('<?xml') + '\n';
+                output.textContent += 'Contains <mxfile: ' + message.content.includes('<mxfile') + '\n';
+            }
+        };
+
+        document.getElementById('loadBtn').onclick = () => {
+            output.textContent += '\nSending load request...\n';
+            ws.send(JSON.stringify({
+                action: 'load_diagram',
+                diagramId: 'af8a09c1-deb2-4c02-b5d4-4f551a17ff3d'
+            }));
+        };
+    </script>
+</body>
+</html>

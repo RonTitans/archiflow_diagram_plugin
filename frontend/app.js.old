@@ -1,0 +1,738 @@
+// ArchiFlow Network Diagram Editor - Main Application
+class ArchiFlowEditor {
+    constructor() {
+        // Configuration
+        this.EMBED_URL = 'https://embed.diagrams.net/';
+        this.WS_URL = 'ws://localhost:3333';
+
+        // State
+        this.editor = null;
+        this.ws = null;
+        this.currentDiagramId = null;
+        this.currentDiagramData = null;
+        this.isConnected = false;
+        this.isDirty = false;
+        this.autoSaveTimer = null;
+        this.diagrams = [];
+        this.sites = [];
+        this.drawioReady = false;
+
+        // Initialize
+        this.init();
+    }
+
+    init() {
+        console.log('[ArchiFlow] Initializing editor...');
+
+        // Initialize Draw.io
+        this.initDrawio();
+
+        // Initialize WebSocket
+        this.connectWebSocket();
+
+        // Setup event listeners
+        this.setupEventListeners();
+
+        // Check for diagram ID in URL
+        this.checkUrlParams();
+
+        // Setup autosave
+        this.setupAutoSave();
+    }
+
+    initDrawio() {
+        const iframe = document.getElementById('drawioEditor');
+
+        // Build URL with parameters - NO initial diagram in URL
+        const params = new URLSearchParams({
+            embed: '1',
+            ui: 'atlas',
+            spin: '1',
+            modified: 'unsavedChanges',
+            libraries: '1',
+            noSaveBtn: '1',
+            noExitBtn: '1',
+            saveAndExit: '0',
+            proto: 'json'
+        });
+
+        iframe.src = this.EMBED_URL + '?' + params.toString();
+
+        iframe.onload = () => {
+            this.editor = iframe.contentWindow;
+            console.log('[Draw.io] iframe loaded, waiting for ready signal...');
+            // Draw.io will send a "ready" message when it's actually ready
+        };
+    }
+
+    connectWebSocket() {
+        console.log('[WebSocket] Connecting to:', this.WS_URL);
+
+        this.ws = new WebSocket(this.WS_URL);
+
+        this.ws.onopen = () => {
+            console.log('[WebSocket] Connected');
+            this.isConnected = true;
+            this.updateConnectionStatus(true);
+
+            // Load diagram list and sites
+            this.loadDiagramList();
+            this.loadSites();
+        };
+
+        this.ws.onmessage = (event) => {
+            try {
+                const message = JSON.parse(event.data);
+                this.handleWebSocketMessage(message);
+            } catch (error) {
+                console.error('[WebSocket] Error parsing message:', error);
+            }
+        };
+
+        this.ws.onerror = (error) => {
+            console.error('[WebSocket] Error:', error);
+            this.updateConnectionStatus(false);
+        };
+
+        this.ws.onclose = () => {
+            console.log('[WebSocket] Connection closed');
+            this.isConnected = false;
+            this.updateConnectionStatus(false);
+
+            // Attempt reconnection
+            setTimeout(() => this.connectWebSocket(), 3000);
+        };
+    }
+
+    setupEventListeners() {
+        // Button click handlers
+        document.getElementById('saveBtn').addEventListener('click', () => this.saveDiagram());
+        document.getElementById('loadBtn').addEventListener('click', () => this.showLoadModal());
+        document.getElementById('newBtn').addEventListener('click', () => this.showNewDiagramModal());
+        document.getElementById('versionsBtn').addEventListener('click', () => this.showVersionsModal());
+        document.getElementById('exportBtn').addEventListener('click', () => this.exportDiagram());
+        document.getElementById('editTitleBtn').addEventListener('click', () => this.showEditTitleModal());
+        document.getElementById('toggleSidebarBtn').addEventListener('click', () => this.toggleSidebar());
+
+        // Modal handlers
+        document.getElementById('confirmLoadBtn').addEventListener('click', () => this.confirmLoad());
+        document.getElementById('confirmTitleBtn').addEventListener('click', () => this.confirmTitle());
+        document.getElementById('confirmNewDiagramBtn').addEventListener('click', () => this.confirmNewDiagram());
+
+        // Close modal handlers
+        document.querySelectorAll('.close-btn, .btn-cancel').forEach(btn => {
+            btn.addEventListener('click', (e) => {
+                e.target.closest('.modal').classList.remove('show');
+            });
+        });
+
+        // Draw.io message handler
+        window.addEventListener('message', (evt) => this.handleDrawioMessage(evt));
+    }
+
+    handleDrawioMessage(evt) {
+        if (evt.source !== this.editor) return;
+
+        try {
+            const msg = JSON.parse(evt.data);
+
+            switch(msg.event) {
+                case 'init':
+                    console.log('[Draw.io] Init event received - Draw.io is ready');
+                    if (!this.drawioReady) {
+                        this.drawioReady = true;
+                        // Load pending diagram or empty diagram
+                        this.onDrawioReady();
+                    }
+                    break;
+
+                case 'save':
+                    console.log('[Draw.io] Save event received');
+                    console.log('[Save] XML starts with:', msg.xml ? msg.xml.substring(0, 100) : 'NULL');
+
+                    // Extract mxGraphModel if we got mxfile format
+                    let xmlToSave = msg.xml;
+                    if (msg.xml && msg.xml.includes('<mxfile')) {
+                        console.log('[Save] Extracting mxGraphModel from mxfile wrapper...');
+                        const parser = new DOMParser();
+                        const xmlDoc = parser.parseFromString(msg.xml, 'text/xml');
+                        const graphModel = xmlDoc.querySelector('mxGraphModel');
+                        if (graphModel) {
+                            xmlToSave = new XMLSerializer().serializeToString(graphModel);
+                            console.log('[Save] Extracted mxGraphModel for saving');
+                        }
+                    }
+
+                    this.currentDiagramData = xmlToSave;
+                    this.saveDiagram();
+                    break;
+
+                case 'autosave':
+                    console.log('[Draw.io] Autosave event');
+
+                    // Extract mxGraphModel if we got mxfile format
+                    let xmlToAutosave = msg.xml;
+                    if (msg.xml && msg.xml.includes('<mxfile')) {
+                        const parser = new DOMParser();
+                        const xmlDoc = parser.parseFromString(msg.xml, 'text/xml');
+                        const graphModel = xmlDoc.querySelector('mxGraphModel');
+                        if (graphModel) {
+                            xmlToAutosave = new XMLSerializer().serializeToString(graphModel);
+                        }
+                    }
+
+                    this.currentDiagramData = xmlToAutosave;
+                    this.isDirty = true;
+                    this.updateSaveIndicator('Unsaved changes');
+                    break;
+
+                case 'export':
+                    if (msg.format === 'xml' && msg.xml) {
+                        this.currentDiagramData = msg.xml;
+                        this.saveToDatabase();
+                    }
+                    break;
+            }
+        } catch (error) {
+            // Ignore non-JSON messages (like 'ready' string)
+            if (evt.data !== 'ready') {
+                console.error('[Draw.io] Error handling message:', error, 'Data:', evt.data);
+            }
+        }
+    }
+
+    handleWebSocketMessage(message) {
+        console.log('[WebSocket] Message received:', message.type || message.action);
+
+        switch(message.type || message.action) {
+            case 'connection':
+                console.log('[WebSocket] Server info:', message);
+                break;
+
+            case 'save_success':
+            case 'diagram_saved':
+                this.onSaveSuccess(message);
+                break;
+
+            case 'load_success':
+            case 'diagram_loaded':
+                this.onLoadSuccess(message);
+                break;
+
+            case 'list_success':
+            case 'diagrams_listed':
+                this.onDiagramsListed(message);
+                break;
+
+            case 'versions_success':
+            case 'versions_retrieved':
+                this.onVersionsRetrieved(message);
+                break;
+
+            case 'sites_listed':
+                this.onSitesListed(message);
+                break;
+
+            case 'error':
+                this.showError(message.message);
+                break;
+        }
+    }
+
+    onDrawioReady() {
+        // Draw.io is ready, send initial diagram
+        const urlParams = new URLSearchParams(window.location.search);
+        const diagramId = urlParams.get('id');
+
+        if (this.pendingLoad) {
+            // We have pending content to load
+            console.log('[Draw.io] Loading pending diagram...');
+            this.editor.postMessage(JSON.stringify({
+                action: 'load',
+                autosave: 1,
+                xml: this.pendingLoad
+            }), '*');
+            this.pendingLoad = null;
+        } else if (diagramId) {
+            // Load specific diagram
+            this.loadDiagram(diagramId);
+        } else {
+            // Load empty diagram immediately
+            const emptyDiagram = `<mxGraphModel dx="1422" dy="754" grid="1" gridSize="10" guides="1" tooltips="1" connect="1" arrows="1" fold="1" page="1" pageScale="1" pageWidth="850" pageHeight="1100" math="0" shadow="0"><root><mxCell id="0"/><mxCell id="1" parent="0"/></root></mxGraphModel>`;
+            console.log('[Draw.io] Loading empty diagram on init');
+            this.editor.postMessage(JSON.stringify({
+                action: 'load',
+                autosave: 1,
+                xml: emptyDiagram
+            }), '*');
+        }
+    }
+
+    saveDiagram() {
+        if (!this.editor) {
+            this.showError('Editor not ready');
+            return;
+        }
+
+        // Request export from Draw.io
+        this.editor.postMessage(JSON.stringify({
+            action: 'export',
+            format: 'xml'
+        }), '*');
+    }
+
+    saveToDatabase() {
+        if (!this.ws || this.ws.readyState !== WebSocket.OPEN) {
+            this.showError('Not connected to server');
+            return;
+        }
+
+        if (!this.currentDiagramData) {
+            this.showError('No diagram data to save');
+            return;
+        }
+
+        this.showLoading('Saving...');
+
+        const diagramId = this.currentDiagramId || this.generateUUID();
+        const title = document.getElementById('diagramTitle').textContent || 'Untitled Diagram';
+        const metadata = this.currentMetadata || { siteId: 'main', siteName: 'Main Site' };
+
+        this.ws.send(JSON.stringify({
+            action: 'save_diagram',
+            diagramId: diagramId,
+            title: title,
+            content: this.currentDiagramData,
+            siteId: metadata.siteId,
+            siteName: metadata.siteName
+        }));
+    }
+
+    onSaveSuccess(message) {
+        this.hideLoading();
+        this.currentDiagramId = message.diagramId;
+        this.isDirty = false;
+        this.updateSaveIndicator('Saved');
+
+        // Update URL
+        const url = new URL(window.location);
+        url.searchParams.set('id', message.diagramId);
+        window.history.replaceState({}, '', url);
+
+        // Reload diagram list
+        this.loadDiagramList();
+
+        setTimeout(() => {
+            this.updateSaveIndicator('');
+        }, 3000);
+    }
+
+    loadDiagram(diagramId) {
+        if (!this.ws || this.ws.readyState !== WebSocket.OPEN) {
+            this.showError('Not connected to server');
+            return;
+        }
+
+        this.showLoading('Loading diagram...');
+
+        this.ws.send(JSON.stringify({
+            action: 'load_diagram',
+            diagramId: diagramId
+        }));
+    }
+
+    onLoadSuccess(message) {
+        this.hideLoading();
+
+        console.log('[DEBUG] onLoadSuccess - Full message:', message);
+
+        if (!message.content) {
+            this.showError('No diagram data found');
+            console.error('[DEBUG] No content field in message:', message);
+            return;
+        }
+
+        this.currentDiagramId = message.diagramId;
+
+        // Extract mxGraphModel from mxfile if necessary
+        let xmlContent = message.content;
+        if (xmlContent.includes('<mxfile')) {
+            console.log('[Load] Extracting mxGraphModel from mxfile wrapper...');
+            const parser = new DOMParser();
+            const xmlDoc = parser.parseFromString(xmlContent, 'text/xml');
+            const graphModel = xmlDoc.querySelector('mxGraphModel');
+            if (graphModel) {
+                // Convert back to string
+                xmlContent = new XMLSerializer().serializeToString(graphModel);
+                console.log('[Load] Extracted mxGraphModel successfully');
+            } else {
+                console.error('[Load] Could not find mxGraphModel in mxfile');
+            }
+        }
+
+        this.currentDiagramData = xmlContent;
+
+        // Debug: Check what we're about to send
+        console.log('[DEBUG] Content type:', typeof xmlContent);
+        console.log('[DEBUG] Content starts with:', xmlContent ? xmlContent.substring(0, 100) : 'NULL');
+
+        // Update title
+        document.getElementById('diagramTitle').textContent = message.title || 'Untitled Diagram';
+
+        // Load into Draw.io
+        if (this.editor && this.drawioReady) {
+            console.log('[Load] Sending diagram to Draw.io...');
+
+            // Draw.io embedded expects only mxGraphModel
+            const drawioMessage = {
+                action: 'load',
+                autosave: 1,
+                xml: xmlContent
+            };
+            console.log('[DEBUG] Message to Draw.io:', drawioMessage);
+            console.log('[DEBUG] XML field starts with:', drawioMessage.xml ? drawioMessage.xml.substring(0, 100) : 'NULL');
+            this.editor.postMessage(JSON.stringify(drawioMessage), '*');
+        } else {
+            console.warn('[Load] Draw.io not ready yet, waiting...');
+            // Store for loading when ready (already extracted)
+            this.pendingLoad = xmlContent;
+        }
+
+        // Update URL
+        const url = new URL(window.location);
+        url.searchParams.set('id', message.diagramId);
+        window.history.replaceState({}, '', url);
+
+        // Close load modal if open
+        document.getElementById('loadModal').classList.remove('show');
+    }
+
+    loadSites() {
+        if (!this.ws || this.ws.readyState !== WebSocket.OPEN) return;
+
+        this.ws.send(JSON.stringify({
+            action: 'list_sites'
+        }));
+    }
+
+    onSitesListed(message) {
+        this.sites = message.sites || [];
+
+        // Update the dropdown
+        const siteSelect = document.getElementById('newDiagramSite');
+        siteSelect.innerHTML = '';
+
+        this.sites.forEach(site => {
+            const option = document.createElement('option');
+            option.value = site.slug || site.name;  // Use slug if available
+            option.textContent = site.name;
+            siteSelect.appendChild(option);
+        });
+
+        // Select first site by default
+        if (this.sites.length > 0) {
+            siteSelect.value = this.sites[0].slug || this.sites[0].name;
+        }
+    }
+
+    showNewDiagramModal() {
+        if (this.isDirty) {
+            if (!confirm('You have unsaved changes. Create new diagram?')) {
+                return;
+            }
+        }
+
+        // Load sites if not loaded yet
+        if (this.sites.length === 0) {
+            this.loadSites();
+        }
+
+        document.getElementById('newDiagramModal').classList.add('show');
+    }
+
+    confirmNewDiagram() {
+        const name = document.getElementById('newDiagramName').value.trim() || 'Untitled Diagram';
+        const site = document.getElementById('newDiagramSite').value;
+
+        // Generate a new UUID for the diagram
+        const newId = this.generateUUID();
+
+        // Close modal
+        document.getElementById('newDiagramModal').classList.remove('show');
+
+        // Create the new diagram
+        this.createNewDiagram(newId, name, site);
+    }
+
+    generateUUID() {
+        return 'xxxxxxxx-xxxx-4xxx-yxxx-xxxxxxxxxxxx'.replace(/[xy]/g, function(c) {
+            const r = Math.random() * 16 | 0;
+            const v = c === 'x' ? r : (r & 0x3 | 0x8);
+            return v.toString(16);
+        });
+    }
+
+    createNewDiagram(diagramId, title, site) {
+        // Reset state
+        this.currentDiagramId = diagramId;
+        this.currentDiagramData = null;
+        this.isDirty = false;
+
+        // Update title
+        document.getElementById('diagramTitle').textContent = title;
+
+        // Store metadata
+        this.currentMetadata = {
+            siteId: site,
+            siteName: site
+        };
+
+        // Load empty diagram
+        const emptyDiagram = `<mxGraphModel dx="1422" dy="754" grid="1" gridSize="10" guides="1" tooltips="1" connect="1" arrows="1" fold="1" page="1" pageScale="1" pageWidth="850" pageHeight="1100" math="0" shadow="0">
+  <root>
+    <mxCell id="0" />
+    <mxCell id="1" parent="0" />
+  </root>
+</mxGraphModel>`;
+
+        if (this.editor && this.drawioReady) {
+            console.log('[New] Loading empty diagram with ID:', diagramId);
+            this.editor.postMessage(JSON.stringify({
+                action: 'load',
+                autosave: 1,
+                xml: emptyDiagram
+            }), '*');
+        } else {
+            console.log('[New] Draw.io not ready, storing empty diagram for later');
+            this.pendingLoad = emptyDiagram;
+        }
+
+        // Update URL with new diagram ID
+        const url = new URL(window.location);
+        url.searchParams.set('id', diagramId);
+        window.history.replaceState({}, '', url);
+
+        // Set as dirty to prompt first save
+        setTimeout(() => {
+            this.isDirty = true;
+            this.updateSaveIndicator('New diagram - unsaved');
+        }, 500);
+    }
+
+    // Keep old method for backward compatibility
+    newDiagram() {
+        this.showNewDiagramModal();
+    }
+
+    loadDiagramList() {
+        if (!this.ws || this.ws.readyState !== WebSocket.OPEN) return;
+
+        this.ws.send(JSON.stringify({
+            action: 'list_diagrams',
+            siteId: null,
+            status: 'all'
+        }));
+    }
+
+    onDiagramsListed(message) {
+        this.diagrams = message.diagrams || [];
+
+        // Update sidebar
+        const listContainer = document.getElementById('diagramList');
+        listContainer.innerHTML = '';
+
+        this.diagrams.forEach(diagram => {
+            const item = document.createElement('div');
+            item.className = 'diagram-item';
+            if (diagram.id === this.currentDiagramId) {
+                item.classList.add('active');
+            }
+
+            item.innerHTML = `
+                <div class="diagram-item-title">${diagram.title || 'Untitled'}</div>
+                <div class="diagram-item-meta">
+                    ${diagram.site_name || 'No site'} •
+                    ${new Date(diagram.modified_at).toLocaleDateString()}
+                </div>
+            `;
+
+            item.addEventListener('click', () => this.loadDiagram(diagram.id));
+
+            listContainer.appendChild(item);
+        });
+
+        // Update recent diagrams in load modal
+        const recentContainer = document.getElementById('recentDiagrams');
+        recentContainer.innerHTML = '';
+
+        this.diagrams.slice(0, 10).forEach(diagram => {
+            const item = document.createElement('div');
+            item.className = 'recent-item';
+
+            item.innerHTML = `
+                <div class="recent-item-title">${diagram.title || 'Untitled'}</div>
+                <div class="recent-item-info">
+                    ID: ${diagram.id.substring(0, 8)}... •
+                    ${new Date(diagram.modified_at).toLocaleDateString()}
+                </div>
+            `;
+
+            item.addEventListener('click', () => {
+                document.getElementById('loadDiagramId').value = diagram.id;
+            });
+
+            recentContainer.appendChild(item);
+        });
+    }
+
+    showLoadModal() {
+        document.getElementById('loadModal').classList.add('show');
+    }
+
+    confirmLoad() {
+        const diagramId = document.getElementById('loadDiagramId').value.trim();
+        if (diagramId) {
+            this.loadDiagram(diagramId);
+        }
+    }
+
+    showVersionsModal() {
+        if (!this.currentDiagramId) {
+            this.showError('No diagram loaded');
+            return;
+        }
+
+        document.getElementById('versionsModal').classList.add('show');
+
+        // Load versions
+        if (this.ws && this.ws.readyState === WebSocket.OPEN) {
+            this.ws.send(JSON.stringify({
+                action: 'get_versions',
+                diagramId: this.currentDiagramId
+            }));
+        }
+    }
+
+    onVersionsRetrieved(message) {
+        const versionList = document.getElementById('versionList');
+        versionList.innerHTML = '';
+
+        if (!message.versions || message.versions.length === 0) {
+            versionList.innerHTML = '<p>No versions found</p>';
+            return;
+        }
+
+        message.versions.forEach(version => {
+            const item = document.createElement('div');
+            item.className = 'version-item';
+
+            item.innerHTML = `
+                <div class="version-number">Version ${version.version_number}</div>
+                <div class="version-date">${new Date(version.created_at).toLocaleString()}</div>
+                <div class="version-summary">${version.change_summary || 'No description'}</div>
+                <div class="version-actions">
+                    <button class="btn" onclick="app.loadVersion('${version.id}')">Load</button>
+                </div>
+            `;
+
+            versionList.appendChild(item);
+        });
+    }
+
+    showEditTitleModal() {
+        const modal = document.getElementById('editTitleModal');
+        const titleInput = document.getElementById('newTitle');
+        const currentTitle = document.getElementById('diagramTitle').textContent;
+
+        titleInput.value = currentTitle;
+        modal.classList.add('show');
+    }
+
+    confirmTitle() {
+        const newTitle = document.getElementById('newTitle').value.trim();
+        const newDescription = document.getElementById('newDescription').value.trim();
+
+        if (newTitle) {
+            document.getElementById('diagramTitle').textContent = newTitle;
+            // Save will include the new title
+            this.isDirty = true;
+        }
+
+        document.getElementById('editTitleModal').classList.remove('show');
+    }
+
+    exportDiagram() {
+        if (!this.editor) return;
+
+        // Request export in different format
+        const format = prompt('Export format (xml, png, svg, pdf):', 'xml');
+
+        if (format) {
+            this.editor.postMessage(JSON.stringify({
+                action: 'export',
+                format: format
+            }), '*');
+        }
+    }
+
+    toggleSidebar() {
+        const sidebar = document.getElementById('sidebar');
+        const button = document.getElementById('toggleSidebarBtn');
+
+        sidebar.classList.toggle('collapsed');
+        button.textContent = sidebar.classList.contains('collapsed') ? '▶' : '◀';
+    }
+
+    setupAutoSave() {
+        // Auto-save every 30 seconds if there are changes
+        setInterval(() => {
+            if (this.isDirty && this.currentDiagramData) {
+                console.log('[AutoSave] Saving changes...');
+                this.saveToDatabase();
+            }
+        }, 30000);
+    }
+
+    checkUrlParams() {
+        const urlParams = new URLSearchParams(window.location.search);
+        const diagramId = urlParams.get('id');
+
+        if (diagramId) {
+            console.log('[URL] Found diagram ID:', diagramId);
+        }
+    }
+
+    updateConnectionStatus(connected) {
+        const status = document.getElementById('status');
+        if (connected) {
+            status.textContent = '● Connected';
+            status.className = 'status connected';
+        } else {
+            status.textContent = '● Disconnected';
+            status.className = 'status disconnected';
+        }
+    }
+
+    updateSaveIndicator(text) {
+        document.getElementById('saveIndicator').textContent = text;
+    }
+
+    showLoading(text = 'Loading...') {
+        const overlay = document.getElementById('loadingOverlay');
+        overlay.querySelector('.loading-text').textContent = text;
+        overlay.classList.add('show');
+    }
+
+    hideLoading() {
+        document.getElementById('loadingOverlay').classList.remove('show');
+    }
+
+    showError(message) {
+        alert('Error: ' + message);
+    }
+}
+
+// Initialize application when DOM is ready
+document.addEventListener('DOMContentLoaded', () => {
+    window.app = new ArchiFlowEditor();
+});

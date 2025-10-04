@@ -1,0 +1,21 @@
+{
+  "name": "archiflow-frontend",
+  "version": "1.0.0",
+  "description": "ArchiFlow Network Diagram Plugin Frontend",
+  "main": "simple-server.js",
+  "scripts": {
+    "serve": "node simple-server.js",
+    "start": "node simple-server.js",
+    "dev": "node simple-server.js"
+  },
+  "keywords": [
+    "drawio",
+    "network",
+    "diagram",
+    "editor"
+  ],
+  "author": "ArchiFlow",
+  "license": "MIT",
+  "dependencies": {},
+  "devDependencies": {}
+}

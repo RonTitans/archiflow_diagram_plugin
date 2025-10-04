@@ -1,0 +1,387 @@
+<!DOCTYPE html>
+<html>
+<head>
+    <meta charset="UTF-8">
+    <title>Test ArchiFlow Plugin Loader</title>
+    <style>
+        body {
+            font-family: -apple-system, BlinkMacSystemFont, 'Segoe UI', Roboto, sans-serif;
+            margin: 20px;
+            background: #f5f5f5;
+        }
+
+        .test-container {
+            max-width: 1200px;
+            margin: 0 auto;
+            background: white;
+            border-radius: 8px;
+            padding: 20px;
+            box-shadow: 0 2px 10px rgba(0,0,0,0.1);
+        }
+
+        h1 {
+            color: #333;
+            margin-bottom: 20px;
+        }
+
+        .status-section {
+            background: #f0f8ff;
+            border-left: 4px solid #2196f3;
+            padding: 15px;
+            margin: 20px 0;
+        }
+
+        .status-item {
+            margin: 10px 0;
+            padding: 8px;
+            background: white;
+            border-radius: 4px;
+            display: flex;
+            align-items: center;
+            gap: 10px;
+        }
+
+        .status-indicator {
+            width: 12px;
+            height: 12px;
+            border-radius: 50%;
+            background: #ddd;
+        }
+
+        .status-indicator.success { background: #4caf50; }
+        .status-indicator.loading { background: #ff9800; animation: pulse 1s infinite; }
+        .status-indicator.error { background: #f44336; }
+
+        @keyframes pulse {
+            0%, 100% { opacity: 1; }
+            50% { opacity: 0.5; }
+        }
+
+        .button-group {
+            display: flex;
+            gap: 10px;
+            margin: 20px 0;
+        }
+
+        button {
+            background: #2196f3;
+            color: white;
+            border: none;
+            padding: 10px 20px;
+            border-radius: 4px;
+            cursor: pointer;
+            font-size: 14px;
+        }
+
+        button:hover { background: #1976d2; }
+        button:disabled { background: #ccc; cursor: not-allowed; }
+
+        .iframe-container {
+            border: 2px solid #ddd;
+            border-radius: 4px;
+            height: 500px;
+            margin: 20px 0;
+        }
+
+        iframe {
+            width: 100%;
+            height: 100%;
+            border: none;
+        }
+
+        .log-container {
+            background: #1e1e1e;
+            color: #d4d4d4;
+            padding: 15px;
+            border-radius: 4px;
+            font-family: 'Consolas', 'Monaco', monospace;
+            font-size: 12px;
+            max-height: 300px;
+            overflow-y: auto;
+            margin-top: 20px;
+        }
+
+        .log-entry {
+            margin: 2px 0;
+            line-height: 1.4;
+        }
+
+        .log-entry.info { color: #58a6ff; }
+        .log-entry.success { color: #3fb950; }
+        .log-entry.error { color: #f85149; }
+        .log-entry.warning { color: #d29922; }
+    </style>
+</head>
+<body>
+    <div class="test-container">
+        <h1>ArchiFlow Plugin Loader Test</h1>
+
+        <div class="status-section">
+            <h3>Connection Status</h3>
+            <div class="status-item">
+                <span class="status-indicator" id="loader-status"></span>
+                <span>Plugin Loader: <strong id="loader-text">Not loaded</strong></span>
+            </div>
+            <div class="status-item">
+                <span class="status-indicator" id="drawio-status"></span>
+                <span>Draw.io: <strong id="drawio-text">Not initialized</strong></span>
+            </div>
+            <div class="status-item">
+                <span class="status-indicator" id="plugin-status"></span>
+                <span>ArchiFlow Plugin: <strong id="plugin-text">Not loaded</strong></span>
+            </div>
+            <div class="status-item">
+                <span class="status-indicator" id="ws-status"></span>
+                <span>WebSocket: <strong id="ws-text">Not connected</strong></span>
+            </div>
+        </div>
+
+        <div class="button-group">
+            <button id="load-loader-btn">Load Plugin Loader</button>
+            <button id="test-plugin-btn" disabled>Test Plugin Functions</button>
+            <button id="test-save-btn" disabled>Test Save to DB</button>
+            <button id="test-load-btn" disabled>Test Load from DB</button>
+            <button id="clear-log-btn">Clear Log</button>
+        </div>
+
+        <div class="iframe-container">
+            <iframe id="test-iframe"></iframe>
+        </div>
+
+        <div class="log-container" id="log-container">
+            <div class="log-entry info">Test page ready. Click "Load Plugin Loader" to begin.</div>
+        </div>
+    </div>
+
+    <script>
+        // Test state
+        let loaderReady = false;
+        let drawioReady = false;
+        let pluginReady = false;
+        let wsConnected = false;
+        let ws = null;
+        let testIframe = null;
+
+        // Logging
+        function log(message, type = 'info') {
+            const logContainer = document.getElementById('log-container');
+            const entry = document.createElement('div');
+            entry.className = `log-entry ${type}`;
+            const timestamp = new Date().toLocaleTimeString();
+            entry.textContent = `[${timestamp}] ${message}`;
+            logContainer.appendChild(entry);
+            logContainer.scrollTop = logContainer.scrollHeight;
+            console.log(`[Test] ${message}`);
+        }
+
+        // Update status
+        function updateStatus(component, status, text) {
+            const indicator = document.getElementById(`${component}-status`);
+            const textEl = document.getElementById(`${component}-text`);
+
+            indicator.className = `status-indicator ${status}`;
+            textEl.textContent = text;
+        }
+
+        // Connect to WebSocket
+        function connectWebSocket() {
+            log('Connecting to WebSocket server...', 'info');
+            ws = new WebSocket('ws://localhost:3333');
+
+            ws.onopen = () => {
+                log('WebSocket connected successfully', 'success');
+                wsConnected = true;
+                updateStatus('ws', 'success', 'Connected');
+            };
+
+            ws.onerror = (error) => {
+                log('WebSocket error: ' + error.message, 'error');
+                updateStatus('ws', 'error', 'Connection failed');
+            };
+
+            ws.onclose = () => {
+                log('WebSocket disconnected', 'warning');
+                wsConnected = false;
+                updateStatus('ws', 'error', 'Disconnected');
+            };
+
+            ws.onmessage = (event) => {
+                try {
+                    const msg = JSON.parse(event.data);
+                    log(`WebSocket message: ${msg.type || msg.action}`, 'info');
+                } catch (e) {
+                    log('WebSocket received non-JSON message', 'warning');
+                }
+            };
+        }
+
+        // Load plugin loader
+        function loadPluginLoader() {
+            log('Loading plugin loader iframe...', 'info');
+            updateStatus('loader', 'loading', 'Loading...');
+
+            testIframe = document.getElementById('test-iframe');
+            testIframe.src = 'plugin-loader.html';
+
+            testIframe.onload = () => {
+                log('Plugin loader iframe loaded', 'success');
+                loaderReady = true;
+                updateStatus('loader', 'success', 'Loaded');
+
+                // Enable test buttons
+                document.getElementById('test-plugin-btn').disabled = false;
+                document.getElementById('test-save-btn').disabled = false;
+                document.getElementById('test-load-btn').disabled = false;
+            };
+
+            testIframe.onerror = (error) => {
+                log('Failed to load plugin loader: ' + error, 'error');
+                updateStatus('loader', 'error', 'Failed to load');
+            };
+        }
+
+        // Listen for messages
+        window.addEventListener('message', (evt) => {
+            try {
+                const msg = JSON.parse(evt.data);
+
+                // Plugin loader status
+                if (msg.source === 'archiflow-loader') {
+                    log(`Plugin loader: ${msg.status}`, 'info');
+
+                    if (msg.status === 'plugin-loaded' || msg.status === 'plugin-loaded-eval') {
+                        pluginReady = true;
+                        updateStatus('plugin', 'success', 'Loaded successfully');
+                        log('ArchiFlow plugin loaded and verified!', 'success');
+                    } else if (msg.status === 'plugin-timeout') {
+                        updateStatus('plugin', 'error', 'Loading timeout');
+                    } else if (msg.status === 'plugin-error') {
+                        updateStatus('plugin', 'error', 'Loading failed');
+                    }
+                }
+
+                // Draw.io messages
+                if (msg.event === 'init') {
+                    log('Draw.io initialization message received', 'success');
+                    drawioReady = true;
+                    updateStatus('drawio', 'success', 'Ready');
+
+                    // Send init response
+                    testIframe.contentWindow.postMessage(JSON.stringify({
+                        action: 'init'
+                    }), '*');
+                }
+
+                // Other Draw.io events
+                if (msg.event === 'save' || msg.event === 'autosave' || msg.event === 'export') {
+                    log(`Draw.io event: ${msg.event}`, 'info');
+                }
+
+            } catch (e) {
+                // Not JSON, might be Draw.io's initial "ready" string
+                if (evt.data === 'ready') {
+                    log('Draw.io sent ready signal', 'info');
+                    updateStatus('drawio', 'loading', 'Initializing...');
+                }
+            }
+        });
+
+        // Test plugin functions
+        function testPlugin() {
+            if (!pluginReady) {
+                log('Plugin not ready yet', 'warning');
+                return;
+            }
+
+            log('Testing plugin functions...', 'info');
+
+            // Try to access plugin in iframe
+            try {
+                const iframeWindow = testIframe.contentWindow;
+
+                // Check for loader API
+                if (iframeWindow.archiflowLoader) {
+                    const status = iframeWindow.archiflowLoader.getStatus();
+                    log(`Plugin loader status: ${status ? 'Active' : 'Inactive'}`, status ? 'success' : 'warning');
+                }
+
+                // Send test message to Draw.io
+                testIframe.contentWindow.postMessage(JSON.stringify({
+                    action: 'load',
+                    autosave: 1,
+                    xml: '<mxGraphModel><root><mxCell id="0"/><mxCell id="1" parent="0"/></root></mxGraphModel>'
+                }), '*');
+
+                log('Sent test diagram to Draw.io', 'success');
+
+            } catch (e) {
+                log('Error testing plugin: ' + e.message, 'error');
+            }
+        }
+
+        // Test save to database
+        function testSaveToDb() {
+            if (!wsConnected) {
+                log('WebSocket not connected', 'error');
+                return;
+            }
+
+            log('Testing save to database...', 'info');
+
+            const testDiagram = {
+                action: 'save_diagram',
+                diagramId: 'test-' + Date.now(),
+                title: 'Test Diagram from Plugin Loader Test',
+                description: 'This is a test diagram',
+                content: '<mxGraphModel><root><mxCell id="0"/><mxCell id="1" parent="0"/></root></mxGraphModel>',
+                siteId: 1
+            };
+
+            ws.send(JSON.stringify(testDiagram));
+            log('Sent test diagram to WebSocket server', 'success');
+        }
+
+        // Test load from database
+        function testLoadFromDb() {
+            if (!wsConnected) {
+                log('WebSocket not connected', 'error');
+                return;
+            }
+
+            log('Testing load from database...', 'info');
+
+            ws.send(JSON.stringify({
+                action: 'list_diagrams',
+                siteId: 1
+            }));
+
+            log('Requested diagram list from server', 'info');
+        }
+
+        // Clear log
+        function clearLog() {
+            const logContainer = document.getElementById('log-container');
+            logContainer.innerHTML = '<div class="log-entry info">Log cleared</div>';
+        }
+
+        // Setup event listeners
+        document.getElementById('load-loader-btn').addEventListener('click', () => {
+            loadPluginLoader();
+            connectWebSocket();
+        });
+
+        document.getElementById('test-plugin-btn').addEventListener('click', testPlugin);
+        document.getElementById('test-save-btn').addEventListener('click', testSaveToDb);
+        document.getElementById('test-load-btn').addEventListener('click', testLoadFromDb);
+        document.getElementById('clear-log-btn').addEventListener('click', clearLog);
+
+        // Initial log
+        log('Test page initialized. This will verify:', 'info');
+        log('1. Plugin loader loads correctly', 'info');
+        log('2. Draw.io initializes properly', 'info');
+        log('3. ArchiFlow plugin injects successfully', 'info');
+        log('4. WebSocket connection works', 'info');
+        log('5. Database operations function correctly', 'info');
+    </script>
+</body>
+</html>

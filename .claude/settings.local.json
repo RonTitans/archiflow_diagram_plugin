@@ -1,0 +1,11 @@
+{
+  "permissions": {
+    "allow": [
+      "WebSearch",
+      "Read(//f/Archiflow/drawio-for-Archiflow/archiflow-export/frontend/standalone-app/**)",
+      "Read(//f/Archiflow/drawio-for-Archiflow/archiflow-export/backend/**)"
+    ],
+    "deny": [],
+    "ask": []
+  }
+}
