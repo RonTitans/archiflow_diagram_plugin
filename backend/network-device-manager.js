@@ -255,6 +255,75 @@ class NetworkDeviceManager {
         }
     }
 
+    // Allocate an IP from ip_addresses table
+    async allocateIPFromPool(ipAddress, deviceName, poolId = null) {
+        try {
+            // Build the WHERE clause based on what we know
+            let whereClause = "ip_address = $1";
+            const params = [ipAddress + '/24']; // Add subnet mask
+
+            if (poolId) {
+                whereClause += " AND pool_id = $2";
+                params.push(poolId);
+            }
+
+            const query = `
+                UPDATE archiflow.ip_addresses
+                SET
+                    device_name = $${params.length + 1},
+                    allocated_at = NOW()
+                WHERE ${whereClause}
+                    AND device_name IS NULL
+                    AND is_gateway = false
+                    AND is_reserved = false
+                RETURNING *
+            `;
+
+            params.push(deviceName);
+
+            const result = await this.db.query(query, params);
+
+            if (result.rows.length === 0) {
+                console.log('[NetworkDeviceManager] IP already allocated or not found:', ipAddress);
+                return null;
+            }
+
+            console.log('[NetworkDeviceManager] IP allocated successfully:', ipAddress, 'to', deviceName);
+            return result.rows[0];
+        } catch (error) {
+            console.error('[NetworkDeviceManager] Error allocating IP:', error);
+            throw error;
+        }
+    }
+
+    // Release an IP back to the pool
+    async releaseIPFromPool(ipAddress) {
+        try {
+            const query = `
+                UPDATE archiflow.ip_addresses
+                SET
+                    device_id = NULL,
+                    device_name = NULL,
+                    allocated_at = NULL
+                WHERE ip_address = $1
+                RETURNING *
+            `;
+
+            const result = await this.db.query(query, [ipAddress + '/24']);
+
+            if (result.rows.length === 0) {
+                console.log('[NetworkDeviceManager] IP not found:', ipAddress);
+                return null;
+            }
+
+            console.log('[NetworkDeviceManager] IP released successfully:', ipAddress);
+            return result.rows[0];
+        } catch (error) {
+            console.error('[NetworkDeviceManager] Error releasing IP:', error);
+            throw error;
+        }
+    }
+
     // =====================================================
     // Port Connection Management
     // =====================================================
@@ -462,6 +531,65 @@ class NetworkDeviceManager {
             return result.rows;
         } catch (error) {
             console.error('[NetworkDeviceManager] Error getting IP pools:', error);
+            throw error;
+        }
+    }
+
+    async getPoolIPAddresses(poolId, limit = 100) {
+        try {
+            // Get pool details
+            const poolQuery = `SELECT * FROM archiflow.ip_pools WHERE id = $1`;
+            const poolResult = await this.db.query(poolQuery, [poolId]);
+
+            if (poolResult.rows.length === 0) {
+                throw new Error('IP Pool not found');
+            }
+
+            const pool = poolResult.rows[0];
+
+            // Get all IPs from ip_addresses table for this pool
+            const ipsQuery = `
+                SELECT
+                    ip.ip_address,
+                    ip.is_gateway,
+                    ip.is_reserved,
+                    ip.device_id,
+                    ip.device_name,
+                    ip.allocated_at,
+                    ip.notes,
+                    d.device_type
+                FROM archiflow.ip_addresses ip
+                LEFT JOIN archiflow.network_devices d ON ip.device_id = d.id
+                WHERE ip.pool_id = $1
+                ORDER BY ip.ip_address
+                LIMIT $2
+            `;
+            const ipsResult = await this.db.query(ipsQuery, [poolId, limit]);
+
+            // Format IPs for frontend
+            const ips = ipsResult.rows.map(row => {
+                // Extract just the IP without the subnet mask
+                const ipStr = row.ip_address.split('/')[0];
+
+                return {
+                    ip_address: ipStr,
+                    is_allocated: row.device_id !== null || row.device_name !== null,
+                    is_gateway: row.is_gateway,
+                    is_reserved: row.is_reserved,
+                    device_id: row.device_id,
+                    device_name: row.device_name,
+                    device_type: row.device_type,
+                    allocated_at: row.allocated_at,
+                    notes: row.notes
+                };
+            });
+
+            return {
+                pool,
+                ips
+            };
+        } catch (error) {
+            console.error('[NetworkDeviceManager] Error getting pool IPs:', error);
             throw error;
         }
     }

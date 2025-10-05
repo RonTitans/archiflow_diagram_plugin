@@ -20,7 +20,7 @@ if (DB_MODE !== 'postgresql') {
 
 // Initialize database
 const db = new DatabaseManager();
-const networkDevices = new NetworkDeviceManager(db.pool);
+const networkDevices = new NetworkDeviceManager(db);
 
 // Create HTTP server for health checks
 const server = http.createServer((req, res) => {
@@ -163,6 +163,22 @@ wss.on('connection', (ws, req) => {
 
                 case 'get_ip_pools':
                     await handleGetIPPools(ws, message);
+                    break;
+
+                case 'get_pool_ips':
+                    await handleGetPoolIPs(ws, message);
+                    break;
+
+                case 'allocate_ip_from_pool':
+                    await handleAllocateIPFromPool(ws, message);
+                    break;
+
+                case 'release_ip_from_pool':
+                    await handleReleaseIPFromPool(ws, message);
+                    break;
+
+                case 'cleanup_orphaned_ips':
+                    await handleCleanupOrphanedIPs(ws, message);
                     break;
 
                 case 'map_device_to_diagram':
@@ -750,7 +766,9 @@ async function handleGetDeviceTemplates(ws, message) {
 
 async function handleGetVLANs(ws, message) {
     try {
+        console.log('[GetVLANs] Fetching VLANs for site:', message.siteId);
         const vlans = await networkDevices.getVLANs(message.siteId);
+        console.log('[GetVLANs] Found VLANs:', vlans.length);
 
         ws.send(JSON.stringify({
             type: 'vlans',
@@ -770,7 +788,9 @@ async function handleGetVLANs(ws, message) {
 
 async function handleGetIPPools(ws, message) {
     try {
+        console.log('[GetIPPools] Fetching IP pools for site:', message.siteId);
         const pools = await networkDevices.getIPPools(message.siteId);
+        console.log('[GetIPPools] Found pools:', pools.length);
 
         ws.send(JSON.stringify({
             type: 'ip_pools',
@@ -783,6 +803,106 @@ async function handleGetIPPools(ws, message) {
         ws.send(JSON.stringify({
             type: 'error',
             action: 'get_pools_failed',
+            message: error.message
+        }));
+    }
+}
+
+async function handleGetPoolIPs(ws, message) {
+    try {
+        const { poolId } = message;
+        console.log('[GetPoolIPs] Fetching IPs for pool:', poolId);
+
+        const result = await networkDevices.getPoolIPAddresses(poolId);
+        console.log('[GetPoolIPs] Found IPs:', result.ips.length);
+
+        ws.send(JSON.stringify({
+            type: 'pool_ips',
+            action: 'pool_ips_loaded',
+            pool: result.pool,
+            ips: result.ips
+        }));
+    } catch (error) {
+        console.error('[GetPoolIPs] Error:', error);
+        ws.send(JSON.stringify({
+            type: 'error',
+            action: 'get_pool_ips_failed',
+            message: error.message
+        }));
+    }
+}
+
+async function handleAllocateIPFromPool(ws, message) {
+    try {
+        const { ipAddress, deviceName, poolId } = message;
+        console.log('[AllocateIP] Allocating IP:', ipAddress, 'to device:', deviceName);
+
+        const result = await networkDevices.allocateIPFromPool(ipAddress, deviceName, poolId);
+
+        ws.send(JSON.stringify({
+            type: 'ip_allocated',
+            action: 'ip_allocated_success',
+            ip: result,
+            ipAddress,
+            deviceName
+        }));
+    } catch (error) {
+        console.error('[AllocateIP] Error:', error);
+        ws.send(JSON.stringify({
+            type: 'error',
+            action: 'allocate_ip_failed',
+            message: error.message
+        }));
+    }
+}
+
+async function handleReleaseIPFromPool(ws, message) {
+    try {
+        const { ipAddress, deviceName } = message;
+        console.log('[ReleaseIP] Releasing IP:', ipAddress, 'from device:', deviceName);
+
+        const result = await networkDevices.releaseIPFromPool(ipAddress);
+
+        ws.send(JSON.stringify({
+            type: 'ip_released',
+            action: 'ip_released_success',
+            ip: result,
+            ipAddress,
+            deviceName
+        }));
+
+        console.log('[ReleaseIP] IP released successfully:', ipAddress);
+    } catch (error) {
+        console.error('[ReleaseIP] Error:', error);
+        ws.send(JSON.stringify({
+            type: 'error',
+            action: 'release_ip_failed',
+            message: error.message
+        }));
+    }
+}
+
+async function handleCleanupOrphanedIPs(ws, message) {
+    try {
+        console.log('[CleanupIPs] Cleaning up orphaned IP allocations');
+
+        // Call the cleanup function
+        const query = 'SELECT archiflow.cleanup_orphaned_ips() as released_count';
+        const result = await db.query(query);
+        const releasedCount = result.rows[0].released_count;
+
+        ws.send(JSON.stringify({
+            type: 'orphaned_ips_cleaned',
+            action: 'cleanup_success',
+            releasedCount
+        }));
+
+        console.log(`[CleanupIPs] Released ${releasedCount} orphaned IPs`);
+    } catch (error) {
+        console.error('[CleanupIPs] Error:', error);
+        ws.send(JSON.stringify({
+            type: 'error',
+            action: 'cleanup_failed',
             message: error.message
         }));
     }

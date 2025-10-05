@@ -21,8 +21,151 @@
     var networkDeviceManager = {
         templates: [],
         ipPools: [],
-        pendingDevices: new Map()
+        sites: [],
+        currentSite: null, // Initialize as null
+        pendingDevices: new Map(),
+        deviceCounters: {} // Track device counts locally
     };
+
+    // Generate device name based on type and site
+    function generateDeviceName(template, site) {
+        // Device type prefixes (industry standard)
+        var prefixes = {
+            'switch': 'SW',
+            'router': 'RTR',
+            'firewall': 'FW',
+            'server': 'SRV',
+            'wireless_ap': 'AP',
+            'load_balancer': 'LB',
+            'storage': 'STG',
+            'vm': 'VM'
+        };
+
+        var prefix = prefixes[template.device_type] || 'DEV';
+        var siteCode = 'SITE'; // Default
+
+        if (site) {
+            // Try site_code first, then slug, then first 3 letters of name
+            siteCode = site.site_code || site.slug || site.name.substring(0, 3).toUpperCase();
+            // Clean up the code (remove spaces, special chars)
+            siteCode = siteCode.replace(/[^A-Z0-9]/gi, '').toUpperCase();
+            if (siteCode.length > 6) {
+                siteCode = siteCode.substring(0, 6);
+            }
+        }
+
+        // Get or initialize counter for this combination
+        var counterKey = prefix + '-' + siteCode;
+        if (!networkDeviceManager.deviceCounters[counterKey]) {
+            networkDeviceManager.deviceCounters[counterKey] = 0;
+        }
+
+        // Increment and get number
+        networkDeviceManager.deviceCounters[counterKey]++;
+        var number = String(networkDeviceManager.deviceCounters[counterKey]).padStart(2, '0');
+
+        // Generate name: SW-BACKUP-01 or RTR-MAIN-02
+        return prefix + '-' + siteCode + '-' + number;
+    }
+
+    // Get the graph instance
+    var graph = ui.editor.graph;
+
+    // Helper function to create formatted device labels
+    function createDeviceLabel(deviceData, style) {
+        style = style || 'default'; // default, compact, badge, minimal
+
+        if (style === 'minimal') {
+            // Just the name, IP as tooltip
+            return '<div style="text-align:center;">' +
+                '<div style="font-weight:bold;font-size:14px;color:#2c3e50;">' +
+                deviceData.name + '</div>' +
+                (deviceData.ip_address ?
+                    '<div style="font-size:12px;color:#555;margin-top:3px;font-weight:500;">' +
+                    deviceData.ip_address + '</div>' : '') +
+                '</div>';
+        } else if (style === 'compact') {
+            // Name and IP on same line
+            return '<div style="text-align:center;font-size:10px;">' +
+                '<span style="font-weight:bold;color:#2c3e50;">' + deviceData.name + '</span>' +
+                (deviceData.ip_address ?
+                    ' <span style="color:#95a5a6;">| ' + deviceData.ip_address + '</span>' : '') +
+                '</div>';
+        } else if (style === 'badge') {
+            // IP in a badge style
+            return '<div style="text-align:center;font-family:Arial,sans-serif;">' +
+                '<div style="font-weight:bold;font-size:12px;color:#2c3e50;margin-bottom:3px;">' +
+                deviceData.name + '</div>' +
+                (deviceData.ip_address ?
+                    '<div style="font-size:10px;color:white;background:#3498db;' +
+                    'padding:2px 8px;border-radius:10px;display:inline-block;">' +
+                    deviceData.ip_address + '</div>' : '') +
+                '</div>';
+        } else {
+            // Default style with gray background for IP
+            return '<div style="text-align:center;font-family:Arial,sans-serif;">' +
+                '<div style="font-weight:bold;font-size:12px;color:#333;margin-bottom:2px;">' +
+                deviceData.name + '</div>' +
+                (deviceData.ip_address ?
+                    '<div style="font-size:10px;color:#666;background:#f0f0f0;' +
+                    'padding:2px 6px;border-radius:3px;display:inline-block;">' +
+                    deviceData.ip_address + '</div>' : '') +
+                '</div>';
+        }
+    }
+
+    // Listen for cell removals
+    graph.addListener(mxEvent.REMOVE_CELLS, function(sender, evt) {
+        var cells = evt.getProperty('cells');
+        if (cells && cells.length > 0) {
+            cells.forEach(function(cell) {
+                // Check if this cell has ArchiFlow device data
+                if (cell.archiflowDevice && cell.archiflowDevice.ip_address) {
+                    console.log('[ArchiFlow] Device removed, releasing IP:', cell.archiflowDevice.ip_address);
+
+                    // Notify parent to release the IP
+                    if (window.parent) {
+                        window.parent.postMessage(JSON.stringify({
+                            event: 'archiflow_device_removed',
+                            device: cell.archiflowDevice,
+                            cellId: cell.id
+                        }), '*');
+                    }
+                }
+            });
+        }
+    });
+
+    // Listen for double-clicks to edit devices
+    graph.addListener(mxEvent.DOUBLE_CLICK, function(sender, evt) {
+        var cell = evt.getProperty('cell');
+
+        // Only handle cells with ArchiFlow device data
+        if (cell && cell.archiflowDevice) {
+            evt.consume(); // Prevent default double-click behavior
+
+            console.log('[ArchiFlow] Double-click on device:', cell.archiflowDevice);
+
+            // Find the template for this device
+            var template = networkDeviceManager.templates.find(function(t) {
+                return t.id === cell.archiflowDevice.template_id;
+            });
+
+            // If no template found, create a basic one from device data
+            if (!template) {
+                console.log('[ArchiFlow] No template found, creating from device data');
+                template = {
+                    id: cell.archiflowDevice.template_id || 'custom',
+                    name: cell.archiflowDevice.name || 'Network Device',
+                    device_type: cell.archiflowDevice.device_type || 'router',
+                    manufacturer: cell.archiflowDevice.manufacturer || '',
+                    model: cell.archiflowDevice.model || ''
+                };
+            }
+
+            showDeviceConfigDialog(graph, template, cell);
+        }
+    });
 
     // Fetch device templates from backend
     function loadDeviceTemplates() {
@@ -36,6 +179,13 @@
                 if (msg.event === 'archiflow_ip_pools') {
                     networkDeviceManager.ipPools = msg.pools;
                 }
+                if (msg.event === 'archiflow_current_site') {
+                    networkDeviceManager.currentSite = msg.site;
+                    console.log('[ArchiFlow] Current site:', networkDeviceManager.currentSite);
+                }
+                if (msg.event === 'archiflow_pool_ips') {
+                    displayPoolIPs(msg.ips);
+                }
             } catch (e) {
                 // Ignore
             }
@@ -46,6 +196,13 @@
             window.parent.postMessage(JSON.stringify({
                 event: 'archiflow_request_data'
             }), '*');
+
+            // Also request current site
+            window.parent.postMessage(JSON.stringify({
+                event: 'archiflow_request_current_site'
+            }), '*');
+
+            console.log('[ArchiFlow Plugin] Requesting data and current site from parent');
         }
     }
 
@@ -75,7 +232,13 @@
                     'cursor:pointer;display:flex;align-items:center;transition:all 0.2s;" ' +
                     'onmouseover="this.style.background=\'#f5f5f5\';this.style.borderColor=\'#2196F3\';" ' +
                     'onmouseout="this.style.background=\'white\';this.style.borderColor=\'#e0e0e0\';">';
-                html += '<span style="font-size:24px;margin-right:12px;">' + icon + '</span>';
+                // Show image if available, otherwise show icon
+                if (template.image_url) {
+                    html += '<img src="' + template.image_url + '" style="width:60px;height:40px;object-fit:contain;margin-right:12px;" ' +
+                        'onerror="this.outerHTML=\'<span style=\\\'font-size:24px;margin-right:12px;\\\'>' + icon + '</span>\'">';
+                } else {
+                    html += '<span style="font-size:24px;margin-right:12px;">' + icon + '</span>';
+                }
                 html += '<div>';
                 html += '<div style="font-weight:600;margin-bottom:4px;color:#000;">' + template.name + '</div>';
                 html += '<div style="font-size:11px;color:#333;">' + template.device_type + '</div>';
@@ -122,63 +285,154 @@
     }
 
     // Show device configuration dialog
-    function showDeviceConfigDialog(graph, template) {
+    function showDeviceConfigDialog(graph, template, existingCell) {
         var div = document.createElement('div');
         div.style.cssText = 'position:fixed;top:50%;left:50%;transform:translate(-50%,-50%);' +
             'background:white;border:1px solid #ccc;border-radius:8px;' +
             'box-shadow:0 4px 12px rgba(0,0,0,0.15);z-index:10000;' +
             'width:600px;max-height:700px;overflow-y:auto;padding:20px;';
 
-        var html = '<h3 style="margin:0 0 15px 0;color:#000;">Configure ' + template.name + '</h3>';
+        var isEdit = existingCell && existingCell.archiflowDevice;
+        var existingDevice = isEdit ? existingCell.archiflowDevice : null;
+
+        var html = '<h3 style="margin:0 0 15px 0;color:#000;">' + (isEdit ? 'Edit' : 'Configure') + ' ' + template.name + '</h3>';
+
+        // Auto-generate name based on current site
+        var autoGeneratedName = '';
+        if (!isEdit) {
+            // Try to use current site or use a default
+            var siteForNaming = networkDeviceManager.currentSite || { site_code: 'SITE', name: 'Default Site' };
+            autoGeneratedName = generateDeviceName(template, siteForNaming);
+
+            // Request current site from parent if we don't have it
+            if (!networkDeviceManager.currentSite && window.parent) {
+                window.parent.postMessage(JSON.stringify({
+                    event: 'archiflow_request_current_site'
+                }), '*');
+            }
+        }
+
         html += '<div style="margin-bottom:12px;">';
         html += '<label style="display:block;margin-bottom:4px;font-weight:600;color:#000;">Device Name *</label>';
-        html += '<input type="text" id="deviceName" value="' + template.name + '" ' +
-            'style="width:100%;padding:8px;border:1px solid #ddd;border-radius:4px;color:#000;background:#fff;">';
+        html += '<div style="display:flex;gap:8px;">';
+        html += '<input type="text" id="deviceName" value="' +
+            (isEdit && existingDevice.name ? existingDevice.name : autoGeneratedName) + '" ' +
+            'placeholder="Enter device name" ' +
+            'style="flex:1;padding:8px;border:1px solid #ddd;border-radius:4px;color:#000;background:#fff;">';
+        html += '<button id="autoNameBtn" type="button" style="padding:8px 12px;border:1px solid #2196F3;' +
+            'background:#fff;color:#2196F3;border-radius:4px;cursor:pointer;font-size:12px;" title="Generate new name">↻</button>';
+        html += '</div>';
+        html += '<div style="font-size:11px;color:#666;margin-top:4px;">Auto-generated format: TYPE-SITE-NUMBER (e.g., SW-' +
+            (networkDeviceManager.currentSite ? networkDeviceManager.currentSite.site_code : 'SITE') + '-01)</div>';
         html += '</div>';
 
         html += '<div style="display:grid;grid-template-columns:1fr 1fr;gap:12px;margin-bottom:12px;">';
         html += '<div>';
         html += '<label style="display:block;margin-bottom:4px;font-weight:600;color:#000;">Manufacturer</label>';
-        html += '<input type="text" id="deviceManufacturer" value="' + (template.manufacturer || '') + '" ' +
+        html += '<input type="text" id="deviceManufacturer" value="' + (isEdit && existingDevice.manufacturer ? existingDevice.manufacturer : (template.manufacturer || '')) + '" ' +
             'style="width:100%;padding:8px;border:1px solid #ddd;border-radius:4px;color:#000;background:#fff;">';
         html += '</div>';
         html += '<div>';
         html += '<label style="display:block;margin-bottom:4px;font-weight:600;color:#000;">Model</label>';
-        html += '<input type="text" id="deviceModel" value="' + (template.model || '') + '" ' +
+        html += '<input type="text" id="deviceModel" value="' + (isEdit && existingDevice.model ? existingDevice.model : (template.model || '')) + '" ' +
             'style="width:100%;padding:8px;border:1px solid #ddd;border-radius:4px;color:#000;background:#fff;">';
         html += '</div>';
         html += '</div>';
 
         html += '<div style="margin-bottom:12px;">';
         html += '<label style="display:block;margin-bottom:4px;font-weight:600;color:#000;">IP Address</label>';
-        html += '<input type="text" id="deviceIpAddress" placeholder="192.168.1.1" ' +
-            'style="width:100%;padding:8px;border:1px solid #ddd;border-radius:4px;color:#000;background:#fff;">';
+        html += '<div style="display:flex;gap:8px;margin-bottom:8px;">';
+        html += '<select id="ipPoolSelect" style="flex:1;padding:8px;border:1px solid #ddd;border-radius:4px;color:#000;background:#fff;">';
+        html += '<option value="">Select IP Pool...</option>';
+        html += '</select>';
+        html += '<input type="text" id="deviceIpAddress" value="' + (isEdit && existingDevice.ip_address ? existingDevice.ip_address : '') + '" placeholder="Or enter manually" ' +
+            'style="flex:1;padding:8px;border:1px solid #ddd;border-radius:4px;color:#000;background:#fff;">';
+        html += '</div>';
+        html += '<div id="ipListContainer" style="max-height:200px;overflow-y:auto;border:1px solid #ddd;border-radius:4px;display:none;">';
+        html += '<div style="padding:8px;text-align:center;color:#999;">Select a pool to view available IPs</div>';
+        html += '</div>';
         html += '</div>';
 
         html += '<div style="margin-top:20px;text-align:right;">';
         html += '<button id="cancelConfigBtn" style="padding:8px 16px;margin-right:8px;' +
             'border:1px solid #ddd;background:white;border-radius:4px;cursor:pointer;color:#000;">Cancel</button>';
         html += '<button id="addDeviceBtn" style="padding:8px 16px;' +
-            'border:none;background:#2196F3;color:white;border-radius:4px;cursor:pointer;font-weight:500;">Add to Diagram</button>';
+            'border:none;background:#2196F3;color:white;border-radius:4px;cursor:pointer;font-weight:500;">' + (isEdit ? 'Update Device' : 'Add to Diagram') + '</button>';
         html += '</div>';
 
         div.innerHTML = html;
         document.body.appendChild(div);
+
+        // Load IP pools
+        if (networkDeviceManager.ipPools && networkDeviceManager.ipPools.length > 0) {
+            var poolSelect = document.getElementById('ipPoolSelect');
+            networkDeviceManager.ipPools.forEach(function(pool) {
+                var option = document.createElement('option');
+                option.value = pool.id;
+                option.textContent = pool.name + ' (' + pool.network + ')';
+                poolSelect.appendChild(option);
+            });
+        }
+
+        // Handle auto-generate name button (regenerate with new number)
+        document.getElementById('autoNameBtn').addEventListener('click', function() {
+            // Use current site or create a default one
+            var siteToUse = networkDeviceManager.currentSite;
+            if (!siteToUse) {
+                // Try to get from parent one more time
+                if (window.parent) {
+                    window.parent.postMessage(JSON.stringify({
+                        event: 'archiflow_request_current_site'
+                    }), '*');
+                }
+                // Use a default for now
+                siteToUse = { site_code: 'SITE', name: 'Default Site' };
+            }
+
+            var autoName = generateDeviceName(template, siteToUse);
+            document.getElementById('deviceName').value = autoName;
+        });
+
+        // Handle pool selection
+        document.getElementById('ipPoolSelect').addEventListener('change', function(e) {
+            var poolId = e.target.value;
+            if (poolId) {
+                loadPoolIPs(poolId);
+            } else {
+                document.getElementById('ipListContainer').style.display = 'none';
+            }
+        });
+
+        // Function to load IPs from selected pool
+        function loadPoolIPs(poolId) {
+            var container = document.getElementById('ipListContainer');
+            container.style.display = 'block';
+            container.innerHTML = '<div style="padding:8px;text-align:center;color:#999;">Loading IPs...</div>';
+
+            // Send message to get pool IPs
+            window.parent.postMessage(JSON.stringify({
+                action: 'get_pool_ips',
+                poolId: poolId
+            }), '*');
+        }
 
         // Cancel button
         document.getElementById('cancelConfigBtn').addEventListener('click', function() {
             document.body.removeChild(div);
         });
 
-        // Add device button
+        // Add/Update device button
         document.getElementById('addDeviceBtn').addEventListener('click', function() {
+            var poolSelect = document.getElementById('ipPoolSelect');
+            var newIpAddress = document.getElementById('deviceIpAddress').value;
             var deviceData = {
                 template_id: template.id,
                 device_type: template.device_type,
                 name: document.getElementById('deviceName').value,
                 manufacturer: document.getElementById('deviceManufacturer').value,
                 model: document.getElementById('deviceModel').value,
-                ip_address: document.getElementById('deviceIpAddress').value
+                ip_address: newIpAddress,
+                pool_id: poolSelect ? poolSelect.value : null
             };
 
             if (!deviceData.name) {
@@ -186,10 +440,85 @@
                 return;
             }
 
-            // Insert shape into diagram
-            insertDeviceShape(graph, template, deviceData);
+            // Check if we're changing IP addresses
+            if (isEdit && existingDevice.ip_address && existingDevice.ip_address !== newIpAddress) {
+                var confirmMsg = 'You are changing the IP address from ' + existingDevice.ip_address + ' to ' + newIpAddress + '.\n\n';
+                confirmMsg += 'This will release the old IP address back to the pool and allocate the new one.\n\n';
+                confirmMsg += 'Do you want to continue?';
+
+                if (!confirm(confirmMsg)) {
+                    return;
+                }
+
+                // Release old IP
+                if (window.parent) {
+                    window.parent.postMessage(JSON.stringify({
+                        event: 'archiflow_ip_changed',
+                        oldIp: existingDevice.ip_address,
+                        newIp: newIpAddress,
+                        deviceName: deviceData.name
+                    }), '*');
+                }
+            }
+
+            if (isEdit) {
+                // Update existing device
+                updateDeviceShape(graph, existingCell, deviceData);
+            } else {
+                // Insert new shape into diagram
+                insertDeviceShape(graph, template, deviceData);
+            }
             document.body.removeChild(div);
         });
+    }
+
+    // Update existing device shape
+    function updateDeviceShape(graph, cell, deviceData) {
+        var model = graph.getModel();
+
+        model.beginUpdate();
+        try {
+            var label;
+
+            // If the cell has an image, use HTML formatted label
+            if (cell.archiflowDevice && cell.archiflowDevice.image_url) {
+                // Use the same style as in insertDeviceShape
+                label = createDeviceLabel(deviceData, 'minimal');
+
+                var currentStyle = model.getStyle(cell);
+                if (!currentStyle || !currentStyle.includes('html=1')) {
+                    var newStyle = 'shape=image;image=' + cell.archiflowDevice.image_url + ';' +
+                        'verticalLabelPosition=bottom;verticalAlign=top;' +
+                        'labelBackgroundColor=transparent;spacing=8;spacingTop=8;' +
+                        'imageBackground=none;imageBorder=none;' +
+                        'imageAspect=0;html=1';
+                    model.setStyle(cell, newStyle);
+                }
+            } else {
+                // Plain text label for devices without images
+                label = deviceData.name;
+                if (deviceData.ip_address) {
+                    label += '\\n' + deviceData.ip_address;
+                }
+            }
+
+            // Update the cell value
+            model.setValue(cell, label);
+
+            // Update device metadata in the cell
+            cell.archiflowDevice = deviceData;
+
+            // Notify parent window
+            if (window.parent) {
+                window.parent.postMessage(JSON.stringify({
+                    event: 'archiflow_device_updated',
+                    device: deviceData
+                }), '*');
+            }
+
+        } finally {
+            model.endUpdate();
+        }
     }
 
     // Insert device shape into diagram
@@ -199,21 +528,43 @@
 
         model.beginUpdate();
         try {
-            // Get style based on device type
-            var style = getDeviceStyle(template.device_type);
-
             // Create label with device name and IP
             var label = deviceData.name;
             if (deviceData.ip_address) {
                 label += '\\n' + deviceData.ip_address;
             }
 
-            // Insert vertex
-            var vertex = graph.insertVertex(parent, null, label,
-                100, 100, 120, 80, style);
+            var vertex;
+
+            // Check if template has an image
+            if (template.image_url) {
+                // Use the helper function to create formatted label
+                // You can change 'minimal' to 'default', 'compact', or 'badge' for different styles
+                var htmlLabel = createDeviceLabel(deviceData, 'minimal');
+
+                // Use image style for devices with images
+                var imageStyle = 'shape=image;image=' + template.image_url + ';' +
+                    'verticalLabelPosition=bottom;verticalAlign=top;' +
+                    'labelBackgroundColor=transparent;spacing=8;spacingTop=8;' +
+                    'imageBackground=none;imageBorder=none;' +
+                    'imageAspect=0;html=1'; // html=1 enables HTML labels
+
+                // Use template's default dimensions or calculate based on aspect
+                var width = template.default_width || 340;
+                var height = template.default_height || 35;
+
+                vertex = graph.insertVertex(parent, null, htmlLabel,
+                    100, 100, width, height, imageStyle);
+            } else {
+                // Use standard style for devices without images
+                var style = getDeviceStyle(template.device_type);
+                vertex = graph.insertVertex(parent, null, label,
+                    100, 100, 120, 80, style);
+            }
 
             // Store device metadata in the cell
             vertex.archiflowDevice = deviceData;
+            vertex.archiflowDevice.image_url = template.image_url; // Store image URL for later use
 
             // Select the new cell
             graph.setSelectionCell(vertex);
@@ -229,6 +580,77 @@
         } finally {
             model.endUpdate();
         }
+    }
+
+    // Display pool IPs in the container
+    function displayPoolIPs(ips) {
+        var container = document.getElementById('ipListContainer');
+        if (!container) return;
+
+        var html = '<div style="max-height:200px;overflow-y:auto;">';
+
+        if (ips && ips.length > 0) {
+            ips.forEach(function(ipInfo) {
+                var bgColor, textColor, status;
+                var isClickable = true;
+
+                if (ipInfo.is_gateway) {
+                    bgColor = '#fff3e0';
+                    textColor = '#e65100';
+                    status = '🚪 Gateway';
+                    isClickable = false;
+                } else if (ipInfo.is_reserved) {
+                    bgColor = '#fce4ec';
+                    textColor = '#c2185b';
+                    status = '🔐 Reserved';
+                    isClickable = false;
+                } else if (ipInfo.is_allocated) {
+                    bgColor = '#ffebee';
+                    textColor = '#c62828';
+                    status = '🔒 ' + (ipInfo.device_name || 'Allocated');
+                    isClickable = false;
+                } else {
+                    bgColor = '#e8f5e9';
+                    textColor = '#2e7d32';
+                    status = '✅ Available';
+                }
+
+                var cursorStyle = isClickable ? 'pointer' : 'not-allowed';
+
+                html += '<div class="ip-item" data-ip="' + ipInfo.ip_address + '" ' +
+                    'data-clickable="' + isClickable + '" ' +
+                    'style="padding:8px 12px;cursor:' + cursorStyle + ';display:flex;justify-content:space-between;' +
+                    'border-bottom:1px solid #eee;background:' + bgColor + ';" ' +
+                    'onmouseover="this.style.background=\'#f5f5f5\'" ' +
+                    'onmouseout="this.style.background=\'' + bgColor + '\'">';
+                html += '<span style="font-family:monospace;color:#000;">' + ipInfo.ip_address + '</span>';
+                html += '<span style="font-size:12px;color:' + textColor + ';">' + status + '</span>';
+                html += '</div>';
+            });
+        } else {
+            html += '<div style="padding:12px;text-align:center;color:#999;">No IPs available in this pool</div>';
+        }
+
+        html += '</div>';
+        container.innerHTML = html;
+        container.style.display = 'block';
+
+        // Add click handlers to IP items
+        var ipItems = container.querySelectorAll('.ip-item');
+        ipItems.forEach(function(item) {
+            item.addEventListener('click', function() {
+                var isClickable = this.getAttribute('data-clickable') === 'true';
+                if (isClickable) {
+                    var ip = this.getAttribute('data-ip');
+                    document.getElementById('deviceIpAddress').value = ip;
+                    // Highlight selected
+                    ipItems.forEach(function(i) {
+                        i.style.border = 'none';
+                    });
+                    this.style.border = '2px solid #2196F3';
+                }
+            });
+        });
     }
 
     // Get device icon
@@ -297,8 +719,20 @@
             var template = networkDeviceManager.templates.find(function(t) {
                 return t.id === cell.archiflowDevice.template_id;
             });
+
+            // If no template found, create a basic one from device data
+            if (!template && cell.archiflowDevice) {
+                template = {
+                    id: cell.archiflowDevice.template_id || 'custom',
+                    name: cell.archiflowDevice.name || 'Network Device',
+                    device_type: cell.archiflowDevice.device_type || 'router',
+                    manufacturer: cell.archiflowDevice.manufacturer || '',
+                    model: cell.archiflowDevice.model || ''
+                };
+            }
+
             if (template) {
-                showDeviceConfigDialog(ui.editor.graph, template);
+                showDeviceConfigDialog(ui.editor.graph, template, cell);
             }
         }
     });

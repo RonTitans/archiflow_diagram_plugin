@@ -114,6 +114,14 @@ class ArchiFlowEditor {
             this.currentSiteId = e.target.value;
             if (this.currentSiteId) {
                 this.loadDiagramsForSite(this.currentSiteId);
+                // Send current site to plugin
+                const currentSite = this.sites?.find(s => s.id == this.currentSiteId);
+                if (currentSite && this.editor) {
+                    this.editor.contentWindow.postMessage(JSON.stringify({
+                        event: 'archiflow_current_site',
+                        site: currentSite
+                    }), '*');
+                }
             }
         });
 
@@ -220,6 +228,100 @@ class ArchiFlowEditor {
                     this.networkDeviceManager.pendingDevices.set(cellId, msg.device);
                     this.networkDeviceManager.updateDeployButton();
                     this.networkDeviceManager.updateConfiguredDevicesList();
+
+                    // Allocate IP if device has an IP address
+                    if (msg.device.ip_address && this.ws && this.ws.readyState === WebSocket.OPEN) {
+                        console.log('[ArchiFlow] Allocating IP:', msg.device.ip_address, 'for device:', msg.device.name);
+                        this.ws.send(JSON.stringify({
+                            action: 'allocate_ip_from_pool',
+                            ipAddress: msg.device.ip_address,
+                            deviceName: msg.device.name,
+                            poolId: msg.device.pool_id
+                        }));
+                    }
+                }
+                return;
+            }
+
+            // Handle device removed from plugin
+            if (msg.event === 'archiflow_device_removed') {
+                console.log('[ArchiFlow] Device removed from diagram:', msg.device);
+
+                // Release IP if device has an IP address
+                if (msg.device && msg.device.ip_address && this.ws && this.ws.readyState === WebSocket.OPEN) {
+                    console.log('[ArchiFlow] Releasing IP:', msg.device.ip_address);
+                    this.ws.send(JSON.stringify({
+                        action: 'release_ip_from_pool',
+                        ipAddress: msg.device.ip_address,
+                        deviceName: msg.device.name
+                    }));
+                }
+
+                // Remove from pending devices if it exists
+                if (this.networkDeviceManager && msg.cellId) {
+                    this.networkDeviceManager.pendingDevices.delete(msg.cellId);
+                    this.networkDeviceManager.updateDeployButton();
+                    this.networkDeviceManager.updateConfiguredDevicesList();
+                }
+                return;
+            }
+
+            // Handle IP address change
+            if (msg.event === 'archiflow_ip_changed') {
+                console.log('[ArchiFlow] IP address changed from', msg.oldIp, 'to', msg.newIp);
+
+                if (this.ws && this.ws.readyState === WebSocket.OPEN) {
+                    // Release old IP
+                    if (msg.oldIp) {
+                        this.ws.send(JSON.stringify({
+                            action: 'release_ip_from_pool',
+                            ipAddress: msg.oldIp,
+                            deviceName: msg.deviceName
+                        }));
+                    }
+
+                    // Allocate new IP
+                    if (msg.newIp) {
+                        this.ws.send(JSON.stringify({
+                            action: 'allocate_ip_from_pool',
+                            ipAddress: msg.newIp,
+                            deviceName: msg.deviceName
+                        }));
+                    }
+                }
+                return;
+            }
+
+            // Handle device updated from plugin
+            if (msg.event === 'archiflow_device_updated') {
+                console.log('[ArchiFlow] Device updated:', msg.device);
+
+                // Update pending devices if it exists
+                if (this.networkDeviceManager) {
+                    this.networkDeviceManager.updateConfiguredDevicesList();
+                }
+                return;
+            }
+
+            // Handle request for pool IPs
+            if (msg.action === 'get_pool_ips') {
+                console.log('[ArchiFlow] Plugin requesting pool IPs for:', msg.poolId);
+                this.fetchPoolIPs(msg.poolId);
+                return;
+            }
+
+            // Handle request for current site
+            if (msg.event === 'archiflow_request_current_site') {
+                console.log('[ArchiFlow] Plugin requesting current site');
+                if (this.currentSiteId && this.sites) {
+                    const currentSite = this.sites.find(s => s.id == this.currentSiteId);
+                    if (currentSite) {
+                        console.log('[ArchiFlow] Sending current site to plugin:', currentSite);
+                        this.editor.postMessage(JSON.stringify({
+                            event: 'archiflow_current_site',
+                            site: currentSite
+                        }), '*');
+                    }
                 }
                 return;
             }
@@ -317,7 +419,7 @@ class ArchiFlowEditor {
         // Forward network device messages to the network device manager
         if (this.networkDeviceManager) {
             const networkDeviceMessageTypes = [
-                'device_templates', 'ip_pools', 'vlans', 'network_devices',
+                'device_templates', 'ip_pools', 'pool_ips', 'vlans', 'network_devices',
                 'device_created', 'device_updated', 'device_deleted',
                 'device_mapped', 'ip_allocated', 'ip_released'
             ];
@@ -380,6 +482,18 @@ class ArchiFlowEditor {
         } else {
             // Load empty diagram
             this.loadEmptyDiagram();
+        }
+
+        // Send current site to plugin if available
+        if (this.currentSiteId && this.sites) {
+            const currentSite = this.sites.find(s => s.id == this.currentSiteId);
+            if (currentSite) {
+                console.log('[App] Sending current site to plugin:', currentSite);
+                this.editor.postMessage(JSON.stringify({
+                    event: 'archiflow_current_site',
+                    site: currentSite
+                }), '*');
+            }
         }
 
         // Load custom network devices library
@@ -945,6 +1059,24 @@ class ArchiFlowEditor {
             event: 'archiflow_ip_pools',
             pools: this.networkDeviceManager.ipPools
         }), '*');
+    }
+
+    async fetchPoolIPs(poolId) {
+        if (!this.ws || this.ws.readyState !== WebSocket.OPEN || !this.editor) {
+            console.error('[ArchiFlow] WebSocket not ready for pool IPs request');
+            return;
+        }
+
+        try {
+            console.log('[ArchiFlow] Sending get_pool_ips request for pool:', poolId);
+            // Send request to backend
+            this.ws.send(JSON.stringify({
+                action: 'get_pool_ips',
+                poolId: poolId
+            }));
+        } catch (error) {
+            console.error('[ArchiFlow] Error fetching pool IPs:', error);
+        }
     }
 }
 

@@ -168,6 +168,22 @@ class NetworkDeviceManager {
                 this.ipPools = message.pools;
                 this.populateIPPoolDropdown();
                 break;
+            case 'pool_ips':
+                console.log('[NetworkDevices] Received pool IPs:', message.ips.length);
+                // Forward pool IPs to the Draw.io plugin
+                // Get the iframe directly
+                const editorFrame = document.getElementById('drawioEditor');
+                if (editorFrame) {
+                    console.log('[NetworkDevices] Forwarding pool IPs to plugin');
+                    editorFrame.contentWindow.postMessage(JSON.stringify({
+                        event: 'archiflow_pool_ips',
+                        ips: message.ips,
+                        pool: message.pool
+                    }), '*');
+                } else {
+                    console.error('[NetworkDevices] Editor frame not found');
+                }
+                break;
             case 'vlans':
                 this.vlans = message.vlans;
                 break;
@@ -600,7 +616,8 @@ class NetworkDeviceManager {
         }
 
         container.innerHTML = Array.from(this.pendingDevices.values()).map(device => {
-            const primaryIp = device.ip_allocations.find(ip => ip.is_primary);
+            const primaryIp = device.ip_allocations && device.ip_allocations.find ?
+                device.ip_allocations.find(ip => ip.is_primary) : null;
             return `
                 <div class="device-template-item configured-device-item" data-cell-id="${device.cellId}">
                     <div class="device-icon">${this.getDeviceIcon(device.device_type)}</div>
