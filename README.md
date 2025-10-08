@@ -11,6 +11,10 @@ A standalone network diagram plugin that integrates Draw.io for creating, editin
 - ✅ **Docker Support**: Containerized deployment for easy setup
 - ✅ **Auto-save**: Automatic diagram saving every 30 seconds
 - ✅ **Multiple Diagrams**: Support for multiple sites and diagrams
+- ✅ **Network Device Management**: Complete device templates with Cisco switches
+- ✅ **IP Address Management**: Automatic IP allocation from pools with auto-naming
+- ✅ **VLAN Support**: VLAN configuration and tracking
+- ✅ **Device Templates**: Pre-configured network device templates with images
 
 ## Quick Start
 
@@ -24,19 +28,29 @@ A standalone network diagram plugin that integrates Draw.io for creating, editin
 
 1. **Clone the repository**:
 ```bash
-cd F:\ArchiflowDiagramPlugin
+git clone https://github.com/RonTitans/archiflow_diagram_plugin.git
+cd archiflow_diagram_plugin
 ```
 
-2. **Start with Docker Compose**:
+2. **Start with Docker Compose** (Recommended):
 ```bash
 cd docker
 docker-compose up -d
 ```
 
 This will start:
-- PostgreSQL database on port 5432
+- PostgreSQL database on port 5432 (with full schema automatically initialized)
 - WebSocket backend on port 3333
 - Frontend server on port 8081
+- Adminer (DB UI) on port 8082
+- Draw.io on port 8083
+
+**First-time setup**: The database will automatically:
+- Create all required tables (13 tables)
+- Load device templates (11 templates including Cisco C9200-24P)
+- Create IP pools and VLANs
+- Populate 1,270+ IP addresses ready for allocation
+- Set up sample sites with auto-naming
 
 3. **Access the application**:
 Open your browser and navigate to:
@@ -44,12 +58,19 @@ Open your browser and navigate to:
 http://localhost:8081
 ```
 
+4. **Clean deployment** (if you need to start fresh):
+```bash
+cd docker
+docker-compose down -v  # Remove all containers and volumes
+docker-compose up -d    # Start fresh with clean database
+```
+
 ### Manual Setup (Without Docker)
 
 1. **Install PostgreSQL**:
    - Create database named `archiflow`
    - Create user `archiflow_user` with password `archiflow_pass`
-   - Run the schema script: `database/schema.sql`
+   - Run the complete initialization script: `database/init-complete.sql`
 
 2. **Start Backend Server**:
 ```bash
@@ -158,10 +179,28 @@ FRONTEND_PORT=8081
 
 ## Database Schema
 
-The application uses three main tables:
+The application uses 13 main tables:
+
+**Core Tables:**
 - `diagrams`: Stores diagram data and metadata
 - `diagram_versions`: Tracks version history
-- `sites`: Manages site information
+- `sites`: Manages site information with auto-naming codes
+
+**Network Device Tables:**
+- `network_devices`: Network device inventory
+- `device_templates`: Pre-configured device templates with images
+- `device_diagram_mapping`: Maps devices to diagram cells
+- `device_counters`: Auto-naming counters per site/device type
+
+**IP Management Tables:**
+- `ip_pools`: Network IP pool definitions
+- `ip_addresses`: Pre-populated IP addresses for each pool (~1,270 IPs)
+- `ip_allocations`: Device IP allocations
+- `vlans`: VLAN configurations
+
+**Connection Tables:**
+- `port_connections`: Physical device connections
+- `schema_migrations`: Database version tracking
 
 ## Troubleshooting
 
