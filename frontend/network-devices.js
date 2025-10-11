@@ -87,7 +87,10 @@ class NetworkDeviceManager {
             });
         });
 
-        // Deploy button - override existing handler to include device deployment
+        // Deploy button - handled by app.js (NetBox deployment)
+        // NOTE: Deploy button click handler is in app.js -> confirmDeploy()
+        // which calls the NetBox deployment service via WebSocket
+        /*
         const deployBtn = document.getElementById('deployBtn');
         if (deployBtn) {
             // Remove existing listener and add new one
@@ -95,6 +98,7 @@ class NetworkDeviceManager {
             deployBtn.parentNode.replaceChild(newDeployBtn, deployBtn);
             newDeployBtn.addEventListener('click', () => this.handleDeploy());
         }
+        */
 
         // Add Device button - opens template selection
         const addDeviceBtn = document.getElementById('addDeviceBtn');

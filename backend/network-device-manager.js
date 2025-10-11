@@ -256,39 +256,46 @@ class NetworkDeviceManager {
     }
 
     // Allocate an IP from ip_addresses table
-    async allocateIPFromPool(ipAddress, deviceName, poolId = null) {
+    async allocateIPFromPool(ipAddress, deviceName, poolId = null, vlanId = null) {
         try {
-            // Build the WHERE clause based on what we know
-            let whereClause = "ip_address = $1";
-            const params = [ipAddress + '/24']; // Add subnet mask
-
+            // Get the NetBox prefix to determine the subnet
+            let subnet = null;
             if (poolId) {
-                whereClause += " AND pool_id = $2";
-                params.push(poolId);
+                const prefixQuery = `SELECT prefix FROM archiflow.netbox_prefixes WHERE netbox_id = $1`;
+                const prefixResult = await this.db.query(prefixQuery, [poolId]);
+                if (prefixResult.rows.length > 0) {
+                    subnet = prefixResult.rows[0].prefix;
+                }
             }
 
-            const query = `
-                UPDATE archiflow.ip_addresses
-                SET
-                    device_name = $${params.length + 1},
-                    allocated_at = NOW()
-                WHERE ${whereClause}
-                    AND device_name IS NULL
-                    AND is_gateway = false
-                    AND is_reserved = false
-                RETURNING *
+            // Check if IP is already allocated
+            const checkQuery = `
+                SELECT * FROM archiflow.ip_allocations
+                WHERE ip_address = $1
             `;
+            const checkResult = await this.db.query(checkQuery, [ipAddress]);
 
-            params.push(deviceName);
-
-            const result = await this.db.query(query, params);
-
-            if (result.rows.length === 0) {
-                console.log('[NetworkDeviceManager] IP already allocated or not found:', ipAddress);
+            if (checkResult.rows.length > 0) {
+                console.log('[NetworkDeviceManager] IP already allocated:', ipAddress);
                 return null;
             }
 
-            console.log('[NetworkDeviceManager] IP allocated successfully:', ipAddress, 'to', deviceName);
+            // Insert new IP allocation with VLAN
+            const insertQuery = `
+                INSERT INTO archiflow.ip_allocations (
+                    ip_address,
+                    subnet,
+                    vlan_id,
+                    allocation_type,
+                    created_at
+                )
+                VALUES ($1, $2, $3, 'static', NOW())
+                RETURNING *
+            `;
+
+            const result = await this.db.query(insertQuery, [ipAddress, subnet, vlanId]);
+
+            console.log('[NetworkDeviceManager] IP allocated successfully:', ipAddress, 'from prefix', subnet, 'with VLAN', vlanId);
             return result.rows[0];
         } catch (error) {
             console.error('[NetworkDeviceManager] Error allocating IP:', error);
@@ -300,19 +307,15 @@ class NetworkDeviceManager {
     async releaseIPFromPool(ipAddress) {
         try {
             const query = `
-                UPDATE archiflow.ip_addresses
-                SET
-                    device_id = NULL,
-                    device_name = NULL,
-                    allocated_at = NULL
+                DELETE FROM archiflow.ip_allocations
                 WHERE ip_address = $1
                 RETURNING *
             `;
 
-            const result = await this.db.query(query, [ipAddress + '/24']);
+            const result = await this.db.query(query, [ipAddress]);
 
             if (result.rows.length === 0) {
-                console.log('[NetworkDeviceManager] IP not found:', ipAddress);
+                console.log('[NetworkDeviceManager] IP not found or already released:', ipAddress);
                 return null;
             }
 
@@ -422,18 +425,33 @@ class NetworkDeviceManager {
 
     async getDeviceTemplates(category = null) {
         try {
+            // Get device types from NetBox cache
             let query = `
-                SELECT * FROM archiflow.device_templates
+                SELECT
+                    netbox_id as id,
+                    model as name,
+                    manufacturer_name as category,
+                    manufacturer_name as manufacturer,
+                    model,
+                    slug as device_type,
+                    manufacturer_slug,
+                    part_number,
+                    u_height,
+                    is_full_depth,
+                    description,
+                    front_image_url,
+                    rear_image_url
+                FROM archiflow.netbox_device_types
                 WHERE 1=1
             `;
 
             const params = [];
             if (category) {
-                query += ` AND category = $1`;
+                query += ` AND manufacturer_name = $1`;
                 params.push(category);
             }
 
-            query += ` ORDER BY category, name`;
+            query += ` ORDER BY manufacturer_name, model`;
 
             const result = await this.db.query(query, params);
             return result.rows;
@@ -483,20 +501,31 @@ class NetworkDeviceManager {
 
     async getVLANs(siteId = null) {
         try {
+            // Get VLANs from NetBox cache (include site-specific and global VLANs)
             let query = `
-                SELECT * FROM archiflow.vlans
-                WHERE is_active = true
+                SELECT
+                    netbox_id as id,
+                    vid,
+                    name,
+                    site_id,
+                    site_name,
+                    status,
+                    role_name,
+                    description
+                FROM archiflow.netbox_vlans
+                WHERE status = 'active'
             `;
 
             const params = [];
             if (siteId) {
-                query += ` AND site_id = $1`;
+                query += ` AND (site_id = $1 OR site_id IS NULL)`;
                 params.push(siteId);
             }
 
-            query += ` ORDER BY id`;
+            query += ` ORDER BY vid`;
 
             const result = await this.db.query(query, params);
+            console.log(`[NetworkDeviceManager] Found ${result.rows.length} VLANs for site: ${siteId || 'all'}`);
             return result.rows;
         } catch (error) {
             console.error('[NetworkDeviceManager] Error getting VLANs:', error);
@@ -510,24 +539,37 @@ class NetworkDeviceManager {
 
     async getIPPools(siteId = null) {
         try {
+            // Get IP prefixes from NetBox cache (all active prefixes can be used for IP allocation)
             let query = `
                 SELECT
-                    p.*,
-                    COUNT(DISTINCT ip.id) as allocated_count
-                FROM archiflow.ip_pools p
-                LEFT JOIN archiflow.ip_allocations ip ON ip.subnet = p.network
-                WHERE 1=1
+                    netbox_id as id,
+                    prefix as network,
+                    prefix as name,
+                    family,
+                    site_id,
+                    site_name,
+                    vlan_id,
+                    status,
+                    role_name,
+                    is_pool,
+                    description,
+                    0 as allocated_count
+                FROM archiflow.netbox_prefixes
+                WHERE status = 'active'
             `;
 
             const params = [];
             if (siteId) {
-                query += ` AND p.site_id = $1`;
+                // Filter by specific site (allow NULL site_id too with OR condition)
+                query += ` AND (site_id = $1 OR site_id IS NULL)`;
                 params.push(siteId);
             }
+            // If siteId is not provided, return ALL prefixes (no additional filter)
 
-            query += ` GROUP BY p.id ORDER BY p.name`;
+            query += ` ORDER BY prefix`;
 
             const result = await this.db.query(query, params);
+            console.log(`[NetworkDeviceManager] Found ${result.rows.length} IP pools for site: ${siteId || 'all'}`);
             return result.rows;
         } catch (error) {
             console.error('[NetworkDeviceManager] Error getting IP pools:', error);
@@ -535,63 +577,102 @@ class NetworkDeviceManager {
         }
     }
 
-    async getPoolIPAddresses(poolId, limit = 100) {
+    async getPoolIPAddresses(poolId, limit = 254) {
         try {
-            // Get pool details
-            const poolQuery = `SELECT * FROM archiflow.ip_pools WHERE id = $1`;
-            const poolResult = await this.db.query(poolQuery, [poolId]);
+            // Get NetBox prefix details
+            const prefixQuery = `SELECT * FROM archiflow.netbox_prefixes WHERE netbox_id = $1`;
+            const prefixResult = await this.db.query(prefixQuery, [poolId]);
 
-            if (poolResult.rows.length === 0) {
-                throw new Error('IP Pool not found');
+            if (prefixResult.rows.length === 0) {
+                throw new Error('IP Prefix not found');
             }
 
-            const pool = poolResult.rows[0];
+            const prefix = prefixResult.rows[0];
 
-            // Get all IPs from ip_addresses table for this pool
-            const ipsQuery = `
-                SELECT
-                    ip.ip_address,
-                    ip.is_gateway,
-                    ip.is_reserved,
-                    ip.device_id,
-                    ip.device_name,
-                    ip.allocated_at,
-                    ip.notes,
-                    d.device_type
-                FROM archiflow.ip_addresses ip
-                LEFT JOIN archiflow.network_devices d ON ip.device_id = d.id
-                WHERE ip.pool_id = $1
-                ORDER BY ip.ip_address
-                LIMIT $2
+            // Generate all IPs from CIDR
+            const allIPs = this.generateIPsFromCIDR(prefix.prefix, limit);
+
+            // CRITICAL FIX: Get allocated IPs from NetBox cache ONLY (don't mix with ArchiFlow tables)
+            // This shows REAL-TIME data from NetBox, not stale cache
+            const allocatedQuery = `
+                SELECT DISTINCT
+                    CASE
+                        WHEN address LIKE '%/%' THEN split_part(address, '/', 1)
+                        ELSE address
+                    END as ip_address,
+                    device_name,
+                    synced_at as allocated_at,
+                    'netbox' as source
+                FROM archiflow.netbox_ip_addresses
+                WHERE device_name IS NOT NULL
+                  AND address::inet << $1::inet
             `;
-            const ipsResult = await this.db.query(ipsQuery, [poolId, limit]);
-
-            // Format IPs for frontend
-            const ips = ipsResult.rows.map(row => {
-                // Extract just the IP without the subnet mask
-                const ipStr = row.ip_address.split('/')[0];
-
-                return {
-                    ip_address: ipStr,
-                    is_allocated: row.device_id !== null || row.device_name !== null,
-                    is_gateway: row.is_gateway,
-                    is_reserved: row.is_reserved,
-                    device_id: row.device_id,
+            const allocatedResult = await this.db.query(allocatedQuery, [prefix.prefix]);
+            const allocatedMap = {};
+            allocatedResult.rows.forEach(row => {
+                allocatedMap[row.ip_address] = {
                     device_name: row.device_name,
-                    device_type: row.device_type,
                     allocated_at: row.allocated_at,
-                    notes: row.notes
+                    source: row.source
+                };
+            });
+
+            console.log(`[NetworkDeviceManager] Found ${allocatedResult.rows.length} allocated IPs in prefix ${prefix.prefix}`);
+
+            // Format IPs with allocation status
+            const ips = allIPs.map(ip => {
+                const allocated = allocatedMap[ip];
+                return {
+                    ip_address: ip,
+                    is_allocated: !!allocated,
+                    device_name: allocated ? allocated.device_name : null,
+                    allocated_at: allocated ? allocated.allocated_at : null,
+                    is_gateway: false,
+                    is_reserved: false
                 };
             });
 
             return {
-                pool,
+                prefix: prefix.prefix,
                 ips
             };
         } catch (error) {
             console.error('[NetworkDeviceManager] Error getting pool IPs:', error);
             throw error;
         }
+    }
+
+    // Helper method to generate all IPs from a CIDR prefix
+    generateIPsFromCIDR(cidr, limit = 254) {
+        const [networkIP, prefixLength] = cidr.split('/');
+        const prefix = parseInt(prefixLength);
+
+        // Convert IP to integer
+        const ipToInt = (ip) => {
+            return ip.split('.').reduce((acc, octet) => (acc << 8) + parseInt(octet), 0) >>> 0;
+        };
+
+        // Convert integer to IP
+        const intToIP = (int) => {
+            return [
+                (int >>> 24) & 255,
+                (int >>> 16) & 255,
+                (int >>> 8) & 255,
+                int & 255
+            ].join('.');
+        };
+
+        const networkInt = ipToInt(networkIP);
+        const hostBits = 32 - prefix;
+        const numHosts = Math.pow(2, hostBits);
+        const maxIPs = Math.min(numHosts - 2, limit); // -2 for network and broadcast, respect limit
+
+        const ips = [];
+        for (let i = 1; i <= maxIPs; i++) { // Start from 1 to skip network address
+            ips.push(intToIP(networkInt + i));
+        }
+
+        return ips;
     }
 
     // =====================================================
@@ -669,6 +750,62 @@ class NetworkDeviceManager {
         } catch (error) {
             console.error('[NetworkDeviceManager] Error getting devices in diagram:', error);
             throw error;
+        }
+    }
+
+    /**
+     * CRITICAL FIX: Get next available device name counter from NetBox cache + local DB
+     * Prevents duplicate device names by checking BOTH NetBox and ArchiFlow databases
+     * @param {string} prefix - Device type prefix (SW, RTR, FW, etc.)
+     * @param {string} siteCode - Site code (e.g., MAIN, BACKUP, SITE)
+     * @returns {Promise<number>} Next available counter number
+     */
+    async getNextDeviceCounter(prefix, siteCode) {
+        try {
+            const pattern = `${prefix}-${siteCode}-%`;
+            let maxNumber = 0;
+
+            // Query BOTH NetBox cache AND local database for device names
+            const query = `
+                SELECT name FROM archiflow.netbox_devices WHERE name LIKE $1
+                UNION
+                SELECT name FROM archiflow.network_devices WHERE name LIKE $1
+                ORDER BY name DESC
+                LIMIT 100
+            `;
+
+            const result = await this.db.query(query, [pattern]);
+
+            console.log(`[NetworkDeviceManager] Found ${result.rows.length} existing devices matching pattern: ${pattern}`);
+
+            if (result.rows.length === 0) {
+                console.log(`[NetworkDeviceManager] No existing devices found, starting at 1`);
+                return 1;
+            }
+
+            // Parse device names to extract numbers
+            // Pattern: SW-MAIN-01, RTR-BACKUP-02, etc.
+            const regex = new RegExp(`^${prefix}-${siteCode}-(\\d+)$`, 'i');
+
+            for (const row of result.rows) {
+                const match = row.name.match(regex);
+                if (match && match[1]) {
+                    const num = parseInt(match[1], 10);
+                    if (num > maxNumber) {
+                        maxNumber = num;
+                    }
+                }
+            }
+
+            console.log(`[NetworkDeviceManager] Max number found: ${maxNumber}, returning ${maxNumber + 1}`);
+
+            // Return next available number
+            return maxNumber + 1;
+
+        } catch (error) {
+            console.error('[NetworkDeviceManager] Error getting next device counter:', error);
+            // If error, return 1 as fallback
+            return 1;
         }
     }
 }

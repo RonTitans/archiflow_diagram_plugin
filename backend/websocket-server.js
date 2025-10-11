@@ -3,6 +3,10 @@ const http = require('http');
 const { v4: uuidv4 } = require('uuid');
 const DatabaseManager = require('./database');
 const NetworkDeviceManager = require('./network-device-manager');
+const DiagramParser = require('./diagram-parser');
+const DevicePersistence = require('./device-persistence');
+const NetBoxSyncService = require('./netbox/sync-service');
+const NetBoxDeploymentService = require('./netbox/deployment-service');
 
 // Environment configuration
 const WS_PORT = process.env.WS_PORT || 3333;
@@ -18,19 +22,97 @@ if (DB_MODE !== 'postgresql') {
     console.warn('[Server] WARNING: DB_MODE is not set to postgresql. Using mock mode.');
 }
 
-// Initialize database
+// Initialize database and services
 const db = new DatabaseManager();
 const networkDevices = new NetworkDeviceManager(db);
+const diagramParser = new DiagramParser();
+const devicePersistence = new DevicePersistence(db);
+const netboxSync = new NetBoxSyncService(db.pool);
+const netboxDeploy = new NetBoxDeploymentService(db);
 
-// Create HTTP server for health checks
-const server = http.createServer((req, res) => {
+// Create HTTP server for health checks and API endpoints
+const server = http.createServer(async (req, res) => {
+    // Enable CORS
+    res.setHeader('Access-Control-Allow-Origin', '*');
+    res.setHeader('Access-Control-Allow-Methods', 'GET, POST, OPTIONS');
+    res.setHeader('Access-Control-Allow-Headers', 'Content-Type');
+
+    // Handle preflight
+    if (req.method === 'OPTIONS') {
+        res.writeHead(200);
+        res.end();
+        return;
+    }
+
+    // Health check endpoint
     if (req.url === '/health') {
         res.writeHead(200, { 'Content-Type': 'text/plain' });
         res.end('OK');
-    } else {
-        res.writeHead(404);
-        res.end();
+        return;
     }
+
+    // NetBox sync endpoint - sync all data from NetBox
+    if (req.url === '/api/netbox/sync' && req.method === 'POST') {
+        try {
+            console.log('[API] Syncing NetBox data...');
+            const result = await netboxSync.syncAll();
+            res.writeHead(200, { 'Content-Type': 'application/json' });
+            res.end(JSON.stringify(result));
+        } catch (error) {
+            console.error('[API] Sync failed:', error.message);
+            res.writeHead(500, { 'Content-Type': 'application/json' });
+            res.end(JSON.stringify({ error: error.message }));
+        }
+        return;
+    }
+
+    // Get cached sites from ArchiFlow DB
+    if (req.url === '/api/netbox/sites' && req.method === 'GET') {
+        try {
+            const sites = await netboxSync.getCachedSites();
+            res.writeHead(200, { 'Content-Type': 'application/json' });
+            res.end(JSON.stringify(sites));
+        } catch (error) {
+            console.error('[API] Failed to get sites:', error.message);
+            res.writeHead(500, { 'Content-Type': 'application/json' });
+            res.end(JSON.stringify({ error: error.message }));
+        }
+        return;
+    }
+
+    // Get cached device types
+    if (req.url === '/api/netbox/device-types' && req.method === 'GET') {
+        try {
+            const deviceTypes = await netboxSync.getCachedDeviceTypes();
+            res.writeHead(200, { 'Content-Type': 'application/json' });
+            res.end(JSON.stringify(deviceTypes));
+        } catch (error) {
+            console.error('[API] Failed to get device types:', error.message);
+            res.writeHead(500, { 'Content-Type': 'application/json' });
+            res.end(JSON.stringify({ error: error.message }));
+        }
+        return;
+    }
+
+    // Get cached IP prefixes
+    if (req.url.startsWith('/api/netbox/prefixes') && req.method === 'GET') {
+        try {
+            const url = new URL(req.url, `http://${req.headers.host}`);
+            const siteId = url.searchParams.get('site_id');
+            const prefixes = await netboxSync.getCachedPrefixes(siteId);
+            res.writeHead(200, { 'Content-Type': 'application/json' });
+            res.end(JSON.stringify(prefixes));
+        } catch (error) {
+            console.error('[API] Failed to get prefixes:', error.message);
+            res.writeHead(500, { 'Content-Type': 'application/json' });
+            res.end(JSON.stringify({ error: error.message }));
+        }
+        return;
+    }
+
+    // 404 for unknown routes
+    res.writeHead(404);
+    res.end();
 });
 
 // Create WebSocket server
@@ -189,6 +271,18 @@ wss.on('connection', (ws, req) => {
                     await handleGetDevicesInDiagram(ws, message);
                     break;
 
+                case 'deploy_to_netbox':
+                    await handleDeployToNetBox(ws, message);
+                    break;
+
+                case 'deploy_diagram_to_netbox':
+                    await handleDeployDiagramToNetBox(ws, message);
+                    break;
+
+                case 'get_next_device_counter':
+                    await handleGetNextDeviceCounter(ws, message);
+                    break;
+
                 default:
                     ws.send(JSON.stringify({
                         type: 'error',
@@ -220,7 +314,7 @@ wss.on('connection', (ws, req) => {
 // Handle save diagram
 async function handleSaveDiagram(ws, message) {
     try {
-        const { diagramId, content, title, siteId, siteName, description } = message;
+        const { diagramId, content, title, siteId, description } = message;
 
         if (!content) {
             throw new Error('Diagram content is required');
@@ -231,12 +325,15 @@ async function handleSaveDiagram(ws, message) {
 
         // Look up site ID from slug if needed
         let actualSiteId = siteId;
+        let actualSiteName = null;
+
         if (typeof siteId === 'string' && isNaN(parseInt(siteId))) {
-            // It's a slug, look up the ID
-            const siteQuery = `SELECT id FROM archiflow.sites WHERE slug = $1 OR name = $1`;
+            // It's a slug, look up the ID and name
+            const siteQuery = `SELECT id, name FROM archiflow.sites WHERE slug = $1 OR name = $1`;
             const siteResult = await db.query(siteQuery, [siteId]);
             if (siteResult.rows.length > 0) {
                 actualSiteId = siteResult.rows[0].id;
+                actualSiteName = siteResult.rows[0].name;
             } else {
                 actualSiteId = 1; // Default to site ID 1
             }
@@ -244,11 +341,32 @@ async function handleSaveDiagram(ws, message) {
             actualSiteId = parseInt(siteId) || 1;
         }
 
-        // Save to database
+        // Look up site name from database if not already retrieved
+        if (!actualSiteName) {
+            // Try NetBox sites first (primary source)
+            const netboxSiteQuery = `SELECT name FROM archiflow.netbox_sites WHERE netbox_id = $1`;
+            const netboxSiteResult = await db.query(netboxSiteQuery, [actualSiteId]);
+            if (netboxSiteResult.rows.length > 0) {
+                actualSiteName = netboxSiteResult.rows[0].name;
+            } else {
+                // Fallback to legacy sites table
+                const siteQuery = `SELECT name FROM archiflow.sites WHERE id = $1`;
+                const siteResult = await db.query(siteQuery, [actualSiteId]);
+                if (siteResult.rows.length > 0) {
+                    actualSiteName = siteResult.rows[0].name;
+                } else {
+                    throw new Error(`Site not found: ${actualSiteId}`);
+                }
+            }
+        }
+
+        console.log(`[Save] Using site: ID=${actualSiteId}, Name="${actualSiteName}"`);
+
+        // Save diagram to database
         const result = await db.saveDiagram({
             id,
             siteId: actualSiteId,
-            siteName: siteName || 'Default Site',
+            siteName: actualSiteName,
             title: title || 'Untitled Diagram',
             description: description || '',
             diagramData: content,
@@ -256,6 +374,24 @@ async function handleSaveDiagram(ws, message) {
         });
 
         console.log(`[Save] Diagram saved: ${id}`);
+
+        // Extract and save devices from diagram
+        try {
+            console.log(`[Save] Extracting devices from diagram...`);
+            const devices = await diagramParser.extractDevices(content);
+
+            if (devices.length > 0) {
+                console.log(`[Save] Found ${devices.length} devices, saving to database...`);
+                const deviceResults = await devicePersistence.saveDevices(id, devices, actualSiteId);
+                console.log(`[Save] Device persistence results:`, deviceResults);
+            } else {
+                console.log(`[Save] No devices found in diagram`);
+            }
+        } catch (deviceError) {
+            console.error('[Save] Error saving devices:', deviceError);
+            // Don't fail the entire save if device extraction fails
+            // Just log the error and continue
+        }
 
         ws.send(JSON.stringify({
             type: 'save_success',
@@ -834,17 +970,18 @@ async function handleGetPoolIPs(ws, message) {
 
 async function handleAllocateIPFromPool(ws, message) {
     try {
-        const { ipAddress, deviceName, poolId } = message;
-        console.log('[AllocateIP] Allocating IP:', ipAddress, 'to device:', deviceName);
+        const { ipAddress, deviceName, poolId, vlanId } = message;
+        console.log('[AllocateIP] Allocating IP:', ipAddress, 'to device:', deviceName, 'VLAN:', vlanId);
 
-        const result = await networkDevices.allocateIPFromPool(ipAddress, deviceName, poolId);
+        const result = await networkDevices.allocateIPFromPool(ipAddress, deviceName, poolId, vlanId);
 
         ws.send(JSON.stringify({
             type: 'ip_allocated',
             action: 'ip_allocated_success',
             ip: result,
             ipAddress,
-            deviceName
+            deviceName,
+            vlanId
         }));
     } catch (error) {
         console.error('[AllocateIP] Error:', error);
@@ -949,6 +1086,177 @@ async function handleGetDevicesInDiagram(ws, message) {
         ws.send(JSON.stringify({
             type: 'error',
             action: 'get_diagram_devices_failed',
+            message: error.message
+        }));
+    }
+}
+
+async function handleDeployToNetBox(ws, message) {
+    try {
+        const { diagramId, devices, siteId } = message;
+
+        console.log(`[DeployToNetBox] Starting deployment for diagram ${diagramId}`);
+        console.log(`[DeployToNetBox] Deploying ${devices.length} devices to site ${siteId}`);
+
+        if (!diagramId || !devices || !siteId) {
+            throw new Error('Diagram ID, devices array, and site ID are required');
+        }
+
+        // Send initial acknowledgment
+        ws.send(JSON.stringify({
+            type: 'deployment_started',
+            action: 'deployment_started',
+            total: devices.length,
+            message: `Starting deployment of ${devices.length} device(s) to NetBox...`
+        }));
+
+        // Deploy all devices
+        const results = await netboxDeploy.deployDiagram(diagramId, devices, siteId);
+
+        // Update diagram status to deployed if all succeeded
+        if (results.succeeded === results.total) {
+            await netboxDeploy.updateDiagramStatus(diagramId, 'deployed');
+        }
+
+        // Send final results
+        ws.send(JSON.stringify({
+            type: 'deployment_complete',
+            action: 'deployment_complete',
+            results: {
+                total: results.total,
+                succeeded: results.succeeded,
+                failed: results.failed,
+                devices: results.devices
+            },
+            message: results.failed === 0
+                ? `✅ Successfully deployed ${results.succeeded} device(s) to NetBox!`
+                : `⚠️ Deployed ${results.succeeded}/${results.total} device(s). ${results.failed} failed.`
+        }));
+
+        console.log(`[DeployToNetBox] Deployment complete: ${results.succeeded}/${results.total} succeeded`);
+
+    } catch (error) {
+        console.error('[DeployToNetBox] Error:', error);
+        ws.send(JSON.stringify({
+            type: 'error',
+            action: 'deployment_failed',
+            message: error.message,
+            details: error.response?.data || null
+        }));
+    }
+}
+
+async function handleDeployDiagramToNetBox(ws, message) {
+    try {
+        const { diagramId, siteId } = message;
+
+        console.log(`[DeployDiagramToNetBox] Loading and deploying diagram ${diagramId}`);
+
+        if (!diagramId || !siteId) {
+            throw new Error('Diagram ID and site ID are required');
+        }
+
+        // Load the diagram from database
+        const diagramQuery = `SELECT * FROM archiflow.diagrams WHERE id = $1`;
+        const diagramResult = await db.query(diagramQuery, [diagramId]);
+
+        if (diagramResult.rows.length === 0) {
+            throw new Error('Diagram not found');
+        }
+
+        const diagram = diagramResult.rows[0];
+        const diagramXml = diagram.diagram_data;
+
+        console.log(`[DeployDiagramToNetBox] Loaded diagram: ${diagram.title || diagramId}`);
+        console.log(`[DeployDiagramToNetBox] Diagram XML length: ${diagramXml ? diagramXml.length : 0}`);
+
+        // Extract devices from diagram XML
+        const devices = await diagramParser.extractDevices(diagramXml);
+
+        console.log(`[DeployDiagramToNetBox] Extracted ${devices.length} devices from diagram`);
+
+        if (devices.length === 0) {
+            ws.send(JSON.stringify({
+                type: 'error',
+                action: 'deployment_failed',
+                message: 'No devices found in diagram to deploy'
+            }));
+            return;
+        }
+
+        // Send initial acknowledgment
+        ws.send(JSON.stringify({
+            type: 'deployment_started',
+            action: 'deployment_started',
+            total: devices.length,
+            message: `Starting deployment of ${devices.length} device(s) to NetBox...`
+        }));
+
+        // Deploy all devices
+        const results = await netboxDeploy.deployDiagram(diagramId, devices, siteId);
+
+        // Update diagram status to deployed if all succeeded
+        if (results.succeeded === results.total) {
+            await netboxDeploy.updateDiagramStatus(diagramId, 'deployed');
+        }
+
+        // Send final results
+        ws.send(JSON.stringify({
+            type: 'deployment_complete',
+            action: 'deployment_complete',
+            results: {
+                total: results.total,
+                succeeded: results.succeeded,
+                failed: results.failed,
+                devices: results.devices
+            },
+            message: results.failed === 0
+                ? `✅ Successfully deployed ${results.succeeded} device(s) to NetBox!`
+                : `⚠️ Deployed ${results.succeeded}/${results.total} device(s). ${results.failed} failed.`
+        }));
+
+        console.log(`[DeployDiagramToNetBox] Deployment complete: ${results.succeeded}/${results.total} succeeded`);
+
+    } catch (error) {
+        console.error('[DeployDiagramToNetBox] Error:', error);
+        ws.send(JSON.stringify({
+            type: 'error',
+            action: 'deployment_failed',
+            message: error.message,
+            details: error.response?.data || null
+        }));
+    }
+}
+
+/**
+ * BUG FIX #2: Handle get next device counter request
+ * Returns the next available counter number for a device name pattern
+ */
+async function handleGetNextDeviceCounter(ws, message) {
+    try {
+        const { prefix, siteCode } = message;
+
+        if (!prefix || !siteCode) {
+            throw new Error('prefix and siteCode are required');
+        }
+
+        console.log(`[GetNextDeviceCounter] Getting counter for: ${prefix}-${siteCode}`);
+
+        const nextCounter = await networkDevices.getNextDeviceCounter(prefix, siteCode);
+
+        ws.send(JSON.stringify({
+            type: 'next_device_counter',
+            action: 'counter_retrieved',
+            prefix,
+            siteCode,
+            nextCounter
+        }));
+
+    } catch (error) {
+        console.error('[GetNextDeviceCounter] Error:', error);
+        ws.send(JSON.stringify({
+            type: 'error',
+            action: 'get_counter_failed',
             message: error.message
         }));
     }

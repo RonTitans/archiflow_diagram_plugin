@@ -3,7 +3,10 @@
     "allow": [
       "WebSearch",
       "Read(//f/Archiflow/drawio-for-Archiflow/archiflow-export/frontend/standalone-app/**)",
-      "Read(//f/Archiflow/drawio-for-Archiflow/archiflow-export/backend/**)"
+      "Read(//f/Archiflow/drawio-for-Archiflow/archiflow-export/backend/**)",
+      "Bash(docker exec:*)",
+      "Bash(docker run:*)",
+      "Bash(docker logs:*)"
     ],
     "deny": [],
     "ask": []

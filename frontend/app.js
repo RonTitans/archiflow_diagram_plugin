@@ -76,8 +76,8 @@ class ArchiFlowEditor {
                 this.sendTemplatesToPlugin();
             }
 
-            // Load sites first
-            this.loadSites();
+            // Sync NetBox data and load sites
+            this.syncNetBoxData();
         };
 
         this.ws.onmessage = (event) => {
@@ -105,6 +105,8 @@ class ArchiFlowEditor {
     }
 
     setupEventListeners() {
+        console.log('[ArchiFlow] Setting up event listeners...');
+
         // New Diagram Button (both header and welcome)
         document.getElementById('createDiagramBtn')?.addEventListener('click', () => this.showCreateModal());
         document.getElementById('createFirstDiagram')?.addEventListener('click', () => this.showCreateModal());
@@ -129,7 +131,16 @@ class ArchiFlowEditor {
         document.getElementById('saveBtn')?.addEventListener('click', () => this.saveDiagram());
 
         // Deploy button
-        document.getElementById('deployBtn')?.addEventListener('click', () => this.showDeployModal());
+        const deployBtn = document.getElementById('deployBtn');
+        if (deployBtn) {
+            console.log('[ArchiFlow] Deploy button found, attaching click handler');
+            deployBtn.addEventListener('click', () => {
+                console.log('[ArchiFlow] Deploy button CLICKED!');
+                this.showDeployModal();
+            });
+        } else {
+            console.error('[ArchiFlow] Deploy button NOT FOUND in DOM!');
+        }
 
         // More options dropdown
         document.getElementById('moreOptionsBtn')?.addEventListener('click', (e) => this.showDropdownMenu(e));
@@ -231,14 +242,30 @@ class ArchiFlowEditor {
 
                     // Allocate IP if device has an IP address
                     if (msg.device.ip_address && this.ws && this.ws.readyState === WebSocket.OPEN) {
-                        console.log('[ArchiFlow] Allocating IP:', msg.device.ip_address, 'for device:', msg.device.name);
+                        console.log('[ArchiFlow] Allocating IP:', msg.device.ip_address, 'for device:', msg.device.name, 'VLAN:', msg.device.vlan_id);
                         this.ws.send(JSON.stringify({
                             action: 'allocate_ip_from_pool',
                             ipAddress: msg.device.ip_address,
                             deviceName: msg.device.name,
-                            poolId: msg.device.pool_id
+                            poolId: msg.device.pool_id,
+                            vlanId: msg.device.vlan_id
                         }));
                     }
+                }
+                return;
+            }
+
+            // Handle device name counter request from plugin
+            if (msg.event === 'get_next_device_counter') {
+                console.log('[ArchiFlow] Plugin requesting next device counter for:', msg.prefix + '-' + msg.siteCode);
+                if (this.ws && this.ws.readyState === WebSocket.OPEN) {
+                    this.ws.send(JSON.stringify({
+                        action: 'get_next_device_counter',
+                        prefix: msg.prefix,
+                        siteCode: msg.siteCode
+                    }));
+                } else {
+                    console.error('[ArchiFlow] WebSocket not connected, cannot get device counter');
                 }
                 return;
             }
@@ -416,6 +443,18 @@ class ArchiFlowEditor {
     handleWebSocketMessage(message) {
         console.log('[WebSocket] Message received:', message.type || message.action);
 
+        // Handle device counter response and forward to plugin
+        if (message.type === 'next_device_counter') {
+            console.log('[ArchiFlow] Forwarding device counter to plugin:', message.nextCounter);
+            this.editor.postMessage(JSON.stringify({
+                event: 'next_device_counter',
+                nextCounter: message.nextCounter,
+                prefix: message.prefix,
+                siteCode: message.siteCode
+            }), '*');
+            return;
+        }
+
         // Forward network device messages to the network device manager
         if (this.networkDeviceManager) {
             const networkDeviceMessageTypes = [
@@ -456,6 +495,20 @@ class ArchiFlowEditor {
 
             case 'deploy_success':
                 this.onDeploySuccess(message);
+                break;
+
+            case 'deployment_started':
+                console.log('[Deployment] Started:', message);
+                this.showNotification(message.message, 'info');
+                break;
+
+            case 'deployment_complete':
+                this.onDeploymentComplete(message);
+                break;
+
+            case 'deployment_failed':
+                this.showNotification(`Deployment failed: ${message.message}`, 'error');
+                console.error('[Deployment] Failed:', message);
                 break;
 
             case 'delete_success':
@@ -501,15 +554,65 @@ class ArchiFlowEditor {
     }
 
     // Site Management
-    loadSites() {
-        if (!this.ws || this.ws.readyState !== WebSocket.OPEN) return;
+    // Sync NetBox data (called on app load)
+    async syncNetBoxData() {
+        try {
+            console.log('[NetBox] Syncing data from NetBox...');
+            const response = await fetch('http://localhost:3333/api/netbox/sync', {
+                method: 'POST'
+            });
+            const result = await response.json();
+            console.log('[NetBox] Sync completed:', result);
 
-        this.ws.send(JSON.stringify({
-            action: 'list_sites'
-        }));
+            // After sync, load sites
+            this.loadSites();
+        } catch (error) {
+            console.error('[NetBox] Sync failed:', error);
+            // Try to load sites anyway (may have cached data)
+            this.loadSites();
+        }
+    }
+
+    // Load sites from NetBox cache
+    async loadSites() {
+        try {
+            console.log('[Sites] Loading sites from NetBox cache...');
+            const response = await fetch('http://localhost:3333/api/netbox/sites');
+            const sites = await response.json();
+
+            this.sites = sites || [];
+            console.log('[Sites] Loaded', this.sites.length, 'sites from NetBox');
+
+            // Update both site selectors
+            const mainSelector = document.getElementById('siteSelector');
+            const modalSelector = document.getElementById('newDiagramSite');
+
+            if (mainSelector) {
+                mainSelector.innerHTML = '<option value="">Select a site...</option>';
+                this.sites.forEach(site => {
+                    const option = document.createElement('option');
+                    option.value = site.netbox_id; // Use NetBox ID
+                    option.textContent = site.name;
+                    mainSelector.appendChild(option);
+                });
+            }
+
+            if (modalSelector) {
+                modalSelector.innerHTML = '<option value="">Select site...</option>';
+                this.sites.forEach(site => {
+                    const option = document.createElement('option');
+                    option.value = site.netbox_id; // Use NetBox ID
+                    option.textContent = site.name;
+                    modalSelector.appendChild(option);
+                });
+            }
+        } catch (error) {
+            console.error('[Sites] Failed to load sites:', error);
+        }
     }
 
     onSitesListed(message) {
+        // Keep this for backward compatibility with WebSocket
         this.sites = message.sites || [];
         console.log('[Sites] Received', this.sites.length, 'sites');
 
@@ -521,7 +624,7 @@ class ArchiFlowEditor {
             mainSelector.innerHTML = '<option value="">Select a site...</option>';
             this.sites.forEach(site => {
                 const option = document.createElement('option');
-                option.value = site.id;
+                option.value = site.id || site.netbox_id;
                 option.textContent = site.name;
                 mainSelector.appendChild(option);
             });
@@ -531,7 +634,7 @@ class ArchiFlowEditor {
             modalSelector.innerHTML = '<option value="">Select site...</option>';
             this.sites.forEach(site => {
                 const option = document.createElement('option');
-                option.value = site.id;
+                option.value = site.id || site.netbox_id;
                 option.textContent = site.name;
                 modalSelector.appendChild(option);
             });
@@ -768,6 +871,8 @@ class ArchiFlowEditor {
 
     // Deploy Diagram
     showDeployModal() {
+        console.log('[ArchiFlow] Deploy button clicked, showing modal...');
+
         if (!this.currentDiagramId) {
             this.showNotification('No diagram loaded', 'error');
             return;
@@ -775,27 +880,100 @@ class ArchiFlowEditor {
 
         // Find current diagram info
         const diagram = this.diagrams.find(d => d.id === this.currentDiagramId);
-        const site = this.sites.find(s => s.id == this.currentSiteId);
+
+        // Get site - either from this.sites or from diagram data
+        let site = this.sites?.find(s => s.id == this.currentSiteId);
+
+        // If site not found in this.sites, use the diagram's site info
+        if (!site && diagram) {
+            site = {
+                id: diagram.site_id,
+                name: diagram.site_name || 'Unknown Site'
+            };
+            console.log('[ArchiFlow] Using site from diagram:', site);
+        }
+
+        console.log('[ArchiFlow] Diagram:', diagram);
+        console.log('[ArchiFlow] Site:', site);
+        console.log('[ArchiFlow] Current site ID:', this.currentSiteId);
 
         if (diagram && site) {
-            document.getElementById('deployDiagramName').textContent = diagram.title;
+            document.getElementById('deployDiagramName').textContent = diagram.title || 'Untitled';
             document.getElementById('deploySiteName').textContent = site.name;
             document.getElementById('deployModal').style.display = 'flex';
+            console.log('[ArchiFlow] Deploy modal opened');
+        } else {
+            console.error('[ArchiFlow] Could not open deploy modal - missing diagram or site');
+            this.showNotification('Cannot deploy - missing diagram or site information', 'error');
         }
     }
 
-    confirmDeploy() {
+    async confirmDeploy() {
         if (!this.currentDiagramId || !this.ws || this.ws.readyState !== WebSocket.OPEN) {
             return;
         }
 
-        this.ws.send(JSON.stringify({
-            action: 'deploy_diagram',
-            diagramId: this.currentDiagramId,
-            siteId: this.currentSiteId
-        }));
-
+        // Close modal first
         document.getElementById('deployModal').style.display = 'none';
+
+        // Get site ID from currentSiteId or from diagram
+        let siteId = this.currentSiteId;
+        if (!siteId) {
+            const diagram = this.diagrams.find(d => d.id === this.currentDiagramId);
+            siteId = diagram?.site_id;
+            console.log('[ArchiFlow] Using site ID from diagram:', siteId);
+        }
+
+        if (!siteId) {
+            this.showNotification('Cannot deploy - site ID not found', 'error');
+            return;
+        }
+
+        // CRITICAL FIX (Bug #1): Save diagram before deployment to persist devices
+        // This ensures devices don't disappear when switching diagrams
+        console.log('[ArchiFlow] Saving diagram before deployment...');
+        this.showNotification('Saving diagram before deployment...', 'info');
+
+        // Request current diagram XML from Draw.io
+        this.editor.postMessage(JSON.stringify({
+            action: 'export',
+            format: 'xml'
+        }), '*');
+
+        // Wait a moment for the export to complete and trigger save
+        await new Promise(resolve => setTimeout(resolve, 1000));
+
+        let devicesToDeploy = [];
+
+        // First, try to get devices from pendingDevices (newly added devices)
+        if (this.networkDeviceManager && this.networkDeviceManager.pendingDevices.size > 0) {
+            devicesToDeploy = Array.from(this.networkDeviceManager.pendingDevices.values());
+            console.log('[ArchiFlow] Deploying pending devices:', devicesToDeploy);
+
+            // Show deployment progress notification
+            this.showNotification(`Deploying ${devicesToDeploy.length} device(s) to NetBox...`, 'info');
+
+            // Send deploy request to backend with device data
+            this.ws.send(JSON.stringify({
+                action: 'deploy_to_netbox',
+                diagramId: this.currentDiagramId,
+                devices: devicesToDeploy,
+                siteId: siteId
+            }));
+        } else {
+            // If no pending devices, let the backend extract devices from saved diagram
+            console.log('[ArchiFlow] No pending devices, backend will extract from diagram...');
+
+            // Show deployment progress notification
+            this.showNotification('Loading diagram and deploying to NetBox...', 'info');
+
+            // Send deploy request - backend will load diagram and extract devices
+            this.ws.send(JSON.stringify({
+                action: 'deploy_diagram_to_netbox',
+                diagramId: this.currentDiagramId,
+                siteId: siteId
+            }));
+        }
     }
 
     onDeploySuccess(message) {
@@ -812,6 +990,53 @@ class ArchiFlowEditor {
         if (this.currentSiteId) {
             this.loadDiagramsForSite(this.currentSiteId);
         }
+    }
+
+    onDeploymentComplete(message) {
+        console.log('[Deployment] Complete:', message);
+
+        const results = message.results;
+
+        // Show detailed notification
+        if (results.failed === 0) {
+            this.showNotification(message.message, 'success');
+
+            // Clear pending devices
+            if (this.networkDeviceManager) {
+                this.networkDeviceManager.pendingDevices.clear();
+                this.networkDeviceManager.updateDeployButton();
+            }
+
+            // Update status badge
+            const statusEl = document.getElementById('currentDiagramStatus');
+            if (statusEl) {
+                statusEl.className = 'status-badge deployed';
+                statusEl.textContent = 'Deployed';
+            }
+
+            // Reload diagram list to show updated status
+            if (this.currentSiteId) {
+                this.loadDiagramsForSite(this.currentSiteId);
+            }
+
+        } else {
+            // Show warning with failed devices
+            let errorMsg = message.message + '\n\nFailed devices:\n';
+            results.devices.filter(d => !d.success).forEach(d => {
+                errorMsg += `- ${d.deviceName}: ${d.errors.join(', ')}\n`;
+            });
+            this.showNotification(errorMsg, 'error');
+        }
+
+        // Log deployment details
+        console.log('[Deployment] Results:', results);
+        results.devices.forEach(device => {
+            if (device.success) {
+                console.log(`✅ ${device.deviceName}: NetBox Device ID ${device.netboxDeviceId}`);
+            } else {
+                console.error(`❌ ${device.deviceName}: ${device.errors.join(', ')}`);
+            }
+        });
     }
 
     // Delete Diagram
@@ -1058,6 +1283,12 @@ class ArchiFlowEditor {
         this.editor.postMessage(JSON.stringify({
             event: 'archiflow_ip_pools',
             pools: this.networkDeviceManager.ipPools
+        }), '*');
+
+        // Send VLANs
+        this.editor.postMessage(JSON.stringify({
+            event: 'archiflow_vlans',
+            vlans: this.networkDeviceManager.vlans
         }), '*');
     }
 

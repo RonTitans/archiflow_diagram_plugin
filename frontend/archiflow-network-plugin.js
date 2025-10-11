@@ -28,7 +28,7 @@
     };
 
     // Generate device name based on type and site
-    function generateDeviceName(template, site) {
+    async function generateDeviceName(template, site) {
         // Device type prefixes (industry standard)
         var prefixes = {
             'switch': 'SW',
@@ -54,18 +54,59 @@
             }
         }
 
-        // Get or initialize counter for this combination
-        var counterKey = prefix + '-' + siteCode;
-        if (!networkDeviceManager.deviceCounters[counterKey]) {
-            networkDeviceManager.deviceCounters[counterKey] = 0;
+        // CRITICAL FIX: Get next counter from backend (checks NetBox + local DB)
+        console.log('[ArchiFlow] Requesting next device counter for:', prefix + '-' + siteCode);
+
+        try {
+            // Request counter from backend via parent window
+            var counterPromise = new Promise(function(resolve, reject) {
+                var messageHandler = function(event) {
+                    if (event.data && typeof event.data === 'string') {
+                        try {
+                            var data = JSON.parse(event.data);
+                            if (data.event === 'next_device_counter') {
+                                window.removeEventListener('message', messageHandler);
+                                resolve(data.nextCounter);
+                            }
+                        } catch (e) {
+                            // Ignore non-JSON messages
+                        }
+                    }
+                };
+
+                window.addEventListener('message', messageHandler);
+
+                // Timeout after 3 seconds
+                setTimeout(function() {
+                    window.removeEventListener('message', messageHandler);
+                    reject(new Error('Timeout waiting for device counter'));
+                }, 3000);
+
+                // Send request to parent
+                window.parent.postMessage(JSON.stringify({
+                    event: 'get_next_device_counter',
+                    prefix: prefix,
+                    siteCode: siteCode
+                }), '*');
+            });
+
+            var nextCounter = await counterPromise;
+            console.log('[ArchiFlow] Received next counter:', nextCounter);
+            var number = String(nextCounter).padStart(2, '0');
+            return prefix + '-' + siteCode + '-' + number;
+
+        } catch (error) {
+            console.error('[ArchiFlow] Error getting device counter, falling back to local:', error);
+
+            // Fallback to old in-memory counter if backend fails
+            var counterKey = prefix + '-' + siteCode;
+            if (!networkDeviceManager.deviceCounters[counterKey]) {
+                networkDeviceManager.deviceCounters[counterKey] = 0;
+            }
+            networkDeviceManager.deviceCounters[counterKey]++;
+            var number = String(networkDeviceManager.deviceCounters[counterKey]).padStart(2, '0');
+            return prefix + '-' + siteCode + '-' + number;
         }
-
-        // Increment and get number
-        networkDeviceManager.deviceCounters[counterKey]++;
-        var number = String(networkDeviceManager.deviceCounters[counterKey]).padStart(2, '0');
-
-        // Generate name: SW-BACKUP-01 or RTR-MAIN-02
-        return prefix + '-' + siteCode + '-' + number;
     }
 
     // Get the graph instance
@@ -179,6 +220,10 @@
                 if (msg.event === 'archiflow_ip_pools') {
                     networkDeviceManager.ipPools = msg.pools;
                 }
+                if (msg.event === 'archiflow_vlans') {
+                    networkDeviceManager.vlans = msg.vlans;
+                    console.log('[ArchiFlow] VLANs loaded:', networkDeviceManager.vlans);
+                }
                 if (msg.event === 'archiflow_current_site') {
                     networkDeviceManager.currentSite = msg.site;
                     console.log('[ArchiFlow] Current site:', networkDeviceManager.currentSite);
@@ -267,7 +312,7 @@
             item.addEventListener('click', function() {
                 var templateId = this.getAttribute('data-template-id');
                 var template = networkDeviceManager.templates.find(function(t) {
-                    return t.id === templateId;
+                    return String(t.id) === String(templateId);
                 });
                 document.body.removeChild(div);
                 showDeviceConfigDialog(graph, template);
@@ -285,7 +330,7 @@
     }
 
     // Show device configuration dialog
-    function showDeviceConfigDialog(graph, template, existingCell) {
+    async function showDeviceConfigDialog(graph, template, existingCell) {
         var div = document.createElement('div');
         div.style.cssText = 'position:fixed;top:50%;left:50%;transform:translate(-50%,-50%);' +
             'background:white;border:1px solid #ccc;border-radius:8px;' +
@@ -302,7 +347,7 @@
         if (!isEdit) {
             // Try to use current site or use a default
             var siteForNaming = networkDeviceManager.currentSite || { site_code: 'SITE', name: 'Default Site' };
-            autoGeneratedName = generateDeviceName(template, siteForNaming);
+            autoGeneratedName = await generateDeviceName(template, siteForNaming);
 
             // Request current site from parent if we don't have it
             if (!networkDeviceManager.currentSite && window.parent) {
@@ -353,6 +398,14 @@
         html += '</div>';
         html += '</div>';
 
+        // VLAN selection
+        html += '<div style="margin-bottom:12px;">';
+        html += '<label style="display:block;margin-bottom:4px;font-weight:600;color:#000;">VLAN</label>';
+        html += '<select id="vlanSelect" style="width:100%;padding:8px;border:1px solid #ddd;border-radius:4px;color:#000;background:#fff;">';
+        html += '<option value="">Select VLAN...</option>';
+        html += '</select>';
+        html += '</div>';
+
         html += '<div style="margin-top:20px;text-align:right;">';
         html += '<button id="cancelConfigBtn" style="padding:8px 16px;margin-right:8px;' +
             'border:1px solid #ddd;background:white;border-radius:4px;cursor:pointer;color:#000;">Cancel</button>';
@@ -374,6 +427,22 @@
             });
         }
 
+        // Load VLANs
+        if (networkDeviceManager.vlans && networkDeviceManager.vlans.length > 0) {
+            var vlanSelect = document.getElementById('vlanSelect');
+            networkDeviceManager.vlans.forEach(function(vlan) {
+                var option = document.createElement('option');
+                option.value = vlan.id;
+                option.textContent = 'VLAN ' + vlan.vid + ' - ' + vlan.name;
+                vlanSelect.appendChild(option);
+            });
+
+            // Pre-select VLAN if device already has one
+            if (isEdit && existingDevice.vlan_id) {
+                vlanSelect.value = existingDevice.vlan_id;
+            }
+        }
+
         // Handle auto-generate name button (regenerate with new number)
         document.getElementById('autoNameBtn').addEventListener('click', function() {
             // Use current site or create a default one
@@ -389,8 +458,11 @@
                 siteToUse = { site_code: 'SITE', name: 'Default Site' };
             }
 
-            var autoName = generateDeviceName(template, siteToUse);
-            document.getElementById('deviceName').value = autoName;
+            generateDeviceName(template, siteToUse).then(function(autoName) {
+                document.getElementById('deviceName').value = autoName;
+            }).catch(function(error) {
+                console.error('[ArchiFlow] Error generating device name:', error);
+            });
         });
 
         // Handle pool selection
@@ -424,6 +496,7 @@
         // Add/Update device button
         document.getElementById('addDeviceBtn').addEventListener('click', function() {
             var poolSelect = document.getElementById('ipPoolSelect');
+            var vlanSelect = document.getElementById('vlanSelect');
             var newIpAddress = document.getElementById('deviceIpAddress').value;
             var deviceData = {
                 template_id: template.id,
@@ -432,7 +505,8 @@
                 manufacturer: document.getElementById('deviceManufacturer').value,
                 model: document.getElementById('deviceModel').value,
                 ip_address: newIpAddress,
-                pool_id: poolSelect ? poolSelect.value : null
+                pool_id: poolSelect ? poolSelect.value : null,
+                vlan_id: vlanSelect ? vlanSelect.value : null
             };
 
             if (!deviceData.name) {

@@ -11,6 +11,8 @@ services:
       POSTGRES_PASSWORD: archiflow_pass
     volumes:
       - ../database/init-complete.sql:/docker-entrypoint-initdb.d/01-init-complete.sql:ro
+      - ../database/netbox-cache-schema.sql:/docker-entrypoint-initdb.d/02-netbox-cache-schema.sql:ro
+      - ../database/netbox-devices-ips-cache.sql:/docker-entrypoint-initdb.d/03-netbox-devices-ips-cache.sql:ro
       - archiflow-postgres-data:/var/lib/postgresql/data
     ports:
       - "5432:5432"
@@ -104,9 +106,126 @@ services:
       DRAWIO_VIEWER_URL: "null"
       DRAWIO_LIGHTBOX_URL: "null"
 
+  # PostgreSQL for NetBox
+  netbox-postgres:
+    image: postgres:15-alpine
+    container_name: netbox-postgres
+    restart: unless-stopped
+    environment:
+      POSTGRES_DB: netbox
+      POSTGRES_USER: netbox
+      POSTGRES_PASSWORD: netbox
+    volumes:
+      - netbox-postgres-data:/var/lib/postgresql/data
+    networks:
+      - archiflow-network
+    healthcheck:
+      test: ["CMD-SHELL", "pg_isready -U netbox"]
+      interval: 10s
+      timeout: 5s
+      retries: 5
+      start_period: 30s
+
+  # Redis for NetBox
+  netbox-redis:
+    image: redis:7-alpine
+    container_name: netbox-redis
+    restart: unless-stopped
+    command: redis-server --appendonly yes
+    volumes:
+      - netbox-redis-data:/data
+    networks:
+      - archiflow-network
+    healthcheck:
+      test: ["CMD", "redis-cli", "ping"]
+      interval: 10s
+      timeout: 5s
+      retries: 5
+      start_period: 20s
+
+  # Redis Cache for NetBox
+  netbox-redis-cache:
+    image: redis:7-alpine
+    container_name: netbox-redis-cache
+    restart: unless-stopped
+    command: redis-server --maxmemory 256mb --maxmemory-policy allkeys-lru
+    networks:
+      - archiflow-network
+    healthcheck:
+      test: ["CMD", "redis-cli", "ping"]
+      interval: 10s
+      timeout: 5s
+      retries: 5
+      start_period: 20s
+
+  # NetBox
+  netbox:
+    image: netboxcommunity/netbox:v4.0-2.9.1
+    container_name: netbox
+    restart: unless-stopped
+    depends_on:
+      netbox-postgres:
+        condition: service_healthy
+      netbox-redis:
+        condition: service_healthy
+      netbox-redis-cache:
+        condition: service_healthy
+    ports:
+      - "8000:8080"
+    environment:
+      # Database settings
+      DB_HOST: netbox-postgres
+      DB_NAME: netbox
+      DB_USER: netbox
+      DB_PASSWORD: netbox
+
+      # Redis settings
+      REDIS_HOST: netbox-redis
+      REDIS_PORT: 6379
+      REDIS_PASSWORD: ""
+      REDIS_DATABASE: 0
+      REDIS_SSL: "false"
+
+      # Redis cache settings
+      REDIS_CACHE_HOST: netbox-redis-cache
+      REDIS_CACHE_PORT: 6379
+      REDIS_CACHE_PASSWORD: ""
+      REDIS_CACHE_DATABASE: 0
+      REDIS_CACHE_SSL: "false"
+
+      # NetBox settings
+      SECRET_KEY: rtomwcX2e8E8Iq8qSR0TihB7ju7N6I0J2lG7A0WCLUiyf2aKodX9ui6WTEkA5aBOKSI
+      ALLOWED_HOSTS: "*"
+      SUPERUSER_NAME: admin
+      SUPERUSER_EMAIL: admin@example.com
+      SUPERUSER_PASSWORD: admin
+      SUPERUSER_API_TOKEN: 0123456789abcdef0123456789abcdef01234567
+      SKIP_SUPERUSER: "false"
+
+      # Development settings
+      DEBUG: "false"
+      METRICS_ENABLED: "true"
+    volumes:
+      - netbox-media:/opt/netbox/netbox/media
+      - netbox-reports:/opt/netbox/netbox/reports
+      - netbox-scripts:/opt/netbox/netbox/scripts
+    networks:
+      - archiflow-network
+    healthcheck:
+      test: ["CMD", "curl", "-f", "http://localhost:8080/api/"]
+      interval: 30s
+      timeout: 10s
+      retries: 5
+      start_period: 90s
+
 networks:
   archiflow-network:
     driver: bridge
 
 volumes:
   archiflow-postgres-data:
+  netbox-postgres-data:
+  netbox-redis-data:
+  netbox-media:
+  netbox-reports:
+  netbox-scripts:
